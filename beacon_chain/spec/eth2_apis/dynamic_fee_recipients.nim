@@ -1,7 +1,6 @@
 import
   std/tables,
   stew/results,
-  web3/ethtypes,
   ../datatypes/base
 
 type
