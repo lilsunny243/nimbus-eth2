@@ -496,9 +496,14 @@ proc makeBeaconBlockForHeadAndSlot*(
     # need a state root _with_ the block applied
     var info: ForkedEpochInfo
 
+    info "makeBeaconBlockForHeadAndSlot: about to create post-state for proposed block"
+
     process_slots(
       node.dag.cfg, state, slot, cache, info,
       {skipLastStateRootCalculation}).expect("advancing 1 slot should not fail")
+
+
+    info "makeBeaconBlockForHeadAndSlot: post-state created, about to get eth1 data"
 
     let
       eth1Proposal = node.getBlockProposalEth1Data(state)
@@ -511,9 +516,15 @@ proc makeBeaconBlockForHeadAndSlot*(
     # Only current hardfork with execution payloads is Bellatrix
     static: doAssert high(BeaconStateFork) == BeaconStateFork.Bellatrix
 
+    info "makeBeaconBlockForHeadAndSlot: got eth1 data, about get exits"
+
     let
       exits = withState(state):
         node.exitPool[].getBeaconBlockExits(node.dag.cfg, state.data)
+
+    info "makeBeaconBlockForHeadAndSlot: got exits, about get execution payload"
+
+    let
       effectiveExecutionPayload =
         if executionPayload.isSome:
           executionPayload.get
@@ -538,6 +549,8 @@ proc makeBeaconBlockForHeadAndSlot*(
               slot, validator_index
             return ForkedBlockResult.err("Unable to get execution payload")
           maybeExecutionPayload.get
+
+    info "makeBeaconBlockForHeadAndSlot: got execution payload, about to call makeBeaconBlock"
 
     let res = makeBeaconBlock(
       node.dag.cfg,
@@ -822,6 +835,8 @@ proc proposeBlock(node: BeaconNode,
       slot = shortLog(slot)
     return head
 
+  info "proposeBlock: about to generate RANDAO reveal"
+
   let
     fork = node.dag.forkAtEpoch(slot.epoch)
     genesis_validators_root = node.dag.genesis_validators_root
@@ -834,6 +849,8 @@ proc proposeBlock(node: BeaconNode,
                validator = shortLog(validator), error_msg = res.error()
           return head
         res.get()
+
+  info "proposeBlock: generated RANDAO reveal; about to check for MEV"
 
   # https://github.com/ethereum/builder-specs/blob/v0.2.0/specs/validator.md#responsibilites-during-the-merge-transition
   # "Honest validators will not utilize the external builder network until
@@ -852,6 +869,8 @@ proc proposeBlock(node: BeaconNode,
 
   let newBlock = await makeBeaconBlockForHeadAndSlot(
     node, randao, validator_index, node.graffitiBytes, head, slot)
+
+  info "proposeBlock: not using MEV; finished makeBeaconBlockForHeadAndSlot, about to check for slashability"
 
   if newBlock.isErr():
     return head # already logged elsewhere!
@@ -875,6 +894,8 @@ proc proposeBlock(node: BeaconNode,
         existingProposal = notSlashable.error
       return head
 
+    info "proposeBlock: not slashable, about to sign"
+
     let
       signature =
         block:
@@ -885,6 +906,10 @@ proc proposeBlock(node: BeaconNode,
                  validator = shortLog(validator), error_msg = res.error()
             return head
           res.get()
+
+    info "proposeBlock: signed, about to route and broadcast block"
+
+    let
       signedBlock =
         when blck is phase0.BeaconBlock:
           phase0.SignedBeaconBlock(

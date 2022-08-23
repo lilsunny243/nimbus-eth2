@@ -663,7 +663,7 @@ proc getAttestationsForBlock*(pool: var AttestationPool,
   let
     packingDur = Moment.now() - startPackingTick
 
-  debug "Packed attestations for block",
+  info "Packed attestations for block",
     newBlockSlot, packingDur, totalCandidates, attestations = res.len()
   attestation_pool_block_attestation_packing_time.set(
     packingDur.toFloatSeconds())
