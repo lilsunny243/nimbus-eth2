@@ -1498,7 +1498,7 @@ proc pruneBlocksDAG(dag: ChainDAGRef) =
     prunedHeads = hlen - dag.heads.len,
     dagPruneDur = Moment.now() - startTick
 
-# https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.1/sync/optimistic.md#helpers
+# https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.3/sync/optimistic.md#helpers
 template is_optimistic*(dag: ChainDAGRef, root: Eth2Digest): bool =
   root in dag.optimisticRoots
 
@@ -1508,15 +1508,15 @@ proc markBlockInvalid*(dag: ChainDAGRef, root: Eth2Digest) =
   logScope: blck = shortLog(blck)
 
   if not dag.is_optimistic(root):
-    # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.1/sync/optimistic.md#transitioning-from-valid---invalidated-or-invalidated---valid
-    # "It is outside of the scope of the specification since it's only possible
-    # with a faulty EE. Such a scenario requires manual intervention."
+    # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.3/sync/optimistic.md#transitioning-from-valid---invalidated-or-invalidated---valid
+    # "These operations are purposefully omitted. It is outside of the scope of
+    # the specification since it's only possible with a faulty EE."
     warn "markBlockInvalid: attempt to invalidate valid block"
     doAssert strictVerification notin dag.updateFlags
     return
 
-  if root == dag.finalizedHead.blck.root:
-    # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.1/sync/optimistic.md#re-orgs
+  if blck.slot <= dag.finalizedHead.slot:
+    # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.3/sync/optimistic.md#re-orgs
     # "If the justified checkpoint transitions from `NOT_VALIDATED` ->
     # `INVALIDATED`, a consensus engine MAY choose to alert the user and force
     # the application to exit."
@@ -1526,8 +1526,19 @@ proc markBlockInvalid*(dag: ChainDAGRef, root: Eth2Digest) =
     doAssert strictVerification notin dag.updateFlags
     return
 
-  debug "markBlockInvalid"
-  dag.pruneBlockSlot(blck.atSlot())
+  # There can still be stray blocks in DAG, but fork choice won't select them
+  if blck.isAncestorOf(dag.head):
+    debug "markBlockInvalid"
+    var curBlck = dag.head
+    while true:
+      if curBlck == blck or curBlck.slot <= blck.slot:
+        break
+      dag.pruneBlockSlot(curBlck.atSlot())
+      curBlck = blck.parent
+    # TODO update head to parent and/or get head from fc
+  else:
+    debug "markBlockInvalid"
+    dag.pruneBlockSlot(blck.atSlot())
 
 proc markBlockVerified*(
     dag: ChainDAGRef, quarantine: var Quarantine, root: Eth2Digest) =
