@@ -17,7 +17,7 @@ export constants
 export stint, ethtypes.toHex, ethtypes.`==`
 
 const
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/beacon-chain.md#withdrawal-prefixes
+  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/beacon-chain.md#withdrawal-prefixes
   BLS_WITHDRAWAL_PREFIX*: byte = 0
   ETH1_ADDRESS_WITHDRAWAL_PREFIX*: byte = 1
 
@@ -31,13 +31,13 @@ type
   Eth1Address* = ethtypes.Address
 
   RuntimeConfig* = object
-    ## https://github.com/ethereum/consensus-specs/tree/v1.1.10/configs
+    ## https://github.com/ethereum/consensus-specs/tree/v1.3.0/configs
     PRESET_BASE*: string
     CONFIG_NAME*: string
 
     # Transition
     TERMINAL_TOTAL_DIFFICULTY*: UInt256
-    TERMINAL_BLOCK_HASH*: BlockHash # TODO use in eht1monitor
+    TERMINAL_BLOCK_HASH*: BlockHash
 
     # Genesis
     MIN_GENESIS_ACTIVE_VALIDATOR_COUNT*: uint64
@@ -129,7 +129,6 @@ when const_preset == "mainnet":
     # By default, don't use these params
     TERMINAL_BLOCK_HASH: BlockHash.fromHex(
       "0x0000000000000000000000000000000000000000000000000000000000000000"),
-    # TODO TERMINAL_BLOCK_HASH_ACTIVATION_EPOCH: Epoch(uint64.high),
 
     # Genesis
     # ---------------------------------------------------------------
@@ -233,7 +232,6 @@ elif const_preset == "gnosis":
     # By default, don't use these params
     TERMINAL_BLOCK_HASH: BlockHash.fromHex(
       "0x0000000000000000000000000000000000000000000000000000000000000000"),
-    # TODO TERMINAL_BLOCK_HASH_ACTIVATION_EPOCH: Epoch(uint64.high),
 
     # Genesis
     # ---------------------------------------------------------------
@@ -308,7 +306,7 @@ elif const_preset == "minimal":
 
   const SECONDS_PER_SLOT* {.intdefine.}: uint64 = 6
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.1/configs/minimal.yaml
+  # https://github.com/ethereum/consensus-specs/blob/v1.3.0/configs/minimal.yaml
   const defaultRuntimeConfig* = RuntimeConfig(
     # Minimal config
 
@@ -326,14 +324,12 @@ elif const_preset == "minimal":
 
     # Transition
     # ---------------------------------------------------------------
-    # TBD, 2**256-2**10 is a placeholder
+    # 2**256-2**10 for testing minimal network
     TERMINAL_TOTAL_DIFFICULTY:
       u256"115792089237316195423570985008687907853269984665640564039457584007913129638912",
     # By default, don't use these params
     TERMINAL_BLOCK_HASH: BlockHash.fromHex(
       "0x0000000000000000000000000000000000000000000000000000000000000000"),
-    # TODO TERMINAL_BLOCK_HASH_ACTIVATION_EPOCH: Epoch(uint64.high),
-
 
 
     # Genesis
@@ -472,8 +468,8 @@ func parse(T: type DomainType, input: string): T
            {.raises: [ValueError, Defect].} =
   DomainType hexToByteArray(input, 4)
 
-proc readRuntimeConfig*(
-    path: string): (RuntimeConfig, seq[string]) {.
+proc readRuntimeConfig(
+    fileContent: string, path: string): (RuntimeConfig, seq[string]) {.
     raises: [IOError, PresetFileError, PresetIncompatibleError, Defect].} =
   var
     lineNum = 0
@@ -491,7 +487,7 @@ proc readRuntimeConfig*(
     names.add name
 
   var values: Table[string, string]
-  for line in splitLines(readFile(path)):
+  for line in splitLines(fileContent):
     inc lineNum
     if line.len == 0 or line[0] == '#': continue
     # remove any trailing comments
@@ -539,7 +535,6 @@ proc readRuntimeConfig*(
   checkCompatibility HYSTERESIS_QUOTIENT
   checkCompatibility HYSTERESIS_DOWNWARD_MULTIPLIER
   checkCompatibility HYSTERESIS_UPWARD_MULTIPLIER
-  checkCompatibility SAFE_SLOTS_TO_UPDATE_JUSTIFIED
   checkCompatibility MIN_DEPOSIT_AMOUNT
   checkCompatibility MAX_EFFECTIVE_BALANCE
   checkCompatibility EFFECTIVE_BALANCE_INCREMENT
@@ -588,20 +583,6 @@ proc readRuntimeConfig*(
   # Isn't being used as a preset in the usual way: at any time, there's one correct value
   checkCompatibility PROPOSER_SCORE_BOOST
 
-  # BEGIN TODO
-  # It should be possible to remove these once we migrate to the next
-  # release of the consensus test suite:
-  template readAliasedField(currentName: untyped, oldName: static string) =
-    if oldName in values:
-      cfg.currentName = try:
-        parse(typeof(cfg.currentName), values[oldName])
-      except ValueError as err:
-        raise (ref PresetFileError)(msg: "Unable to parse " & oldName)
-
-  readAliasedField DENEB_FORK_EPOCH, "EIP4844_FORK_EPOCH"
-  readAliasedField DENEB_FORK_VERSION, "EIP4844_FORK_VERSION"
-  # END TODO
-
   for name, field in cfg.fieldPairs():
     if name in values:
       try:
@@ -620,13 +601,18 @@ proc readRuntimeConfig*(
 
   (cfg, unknowns)
 
+proc readRuntimeConfig*(
+    path: string): (RuntimeConfig, seq[string]) {.
+    raises: [IOError, PresetFileError, PresetIncompatibleError, Defect].} =
+  readRuntimeConfig(readFile(path), path)
+
 template name*(cfg: RuntimeConfig): string =
   if cfg.CONFIG_NAME.len() > 0:
     cfg.CONFIG_NAME
   else:
     const_preset
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/p2p-interface.md#configuration
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/p2p-interface.md#configuration
 func MIN_EPOCHS_FOR_BLOCK_REQUESTS*(cfg: RuntimeConfig): uint64 =
   cfg.MIN_VALIDATOR_WITHDRAWABILITY_DELAY + cfg.CHURN_LIMIT_QUOTIENT div 2
 

@@ -1,5 +1,5 @@
 # beacon_chain
-# Copyright (c) 2021-2022 Status Research & Development GmbH
+# Copyright (c) 2021-2023 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -9,24 +9,26 @@ import
   std/[tables, os, sets, sequtils, strutils, uri],
   stew/[base10, results, byteutils],
   bearssl/rand, chronos, presto, presto/client as presto_client,
-  chronicles, confutils, json_serialization/std/[options, net],
+  chronicles, confutils,
   metrics, metrics/chronos_httpserver,
   ".."/spec/datatypes/[phase0, altair],
   ".."/spec/[eth2_merkleization, helpers, signatures, validator],
   ".."/spec/eth2_apis/[eth2_rest_serialization, rest_beacon_client,
                        dynamic_fee_recipients],
-  ".."/validators/[keystore_management, validator_pool, slashing_protection],
+  ".."/consensus_object_pools/block_pools_types,
+  ".."/validators/[keystore_management, validator_pool, slashing_protection,
+                   validator_duties],
   ".."/[conf, beacon_clock, version, nimbus_binary_common]
 
 from std/times import Time, toUnix, fromUnix, getTime
 
 export
   os, sets, sequtils, chronos, presto, chronicles, confutils,
-  nimbus_binary_common, version, conf, options, tables, results, base10,
+  nimbus_binary_common, version, conf, tables, results, base10,
   byteutils, presto_client, eth2_rest_serialization, rest_beacon_client,
   phase0, altair, helpers, signatures, validator, eth2_merkleization,
   beacon_clock, keystore_management, slashing_protection, validator_pool,
-  dynamic_fee_recipients, Time, toUnix, fromUnix, getTime
+  dynamic_fee_recipients, Time, toUnix, fromUnix, getTime, block_pools_types
 
 const
   SYNC_TOLERANCE* = 4'u64
@@ -39,17 +41,15 @@ const
   DelayBuckets* = [-Inf, -4.0, -2.0, -1.0, -0.5, -0.1, -0.05,
                    0.05, 0.1, 0.5, 1.0, 2.0, 4.0, 8.0, Inf]
 
+  ZeroTimeDiff* = TimeDiff(nanoseconds: 0'i64)
+
 type
   ServiceState* {.pure.} = enum
     Initialized, Running, Error, Closing, Closed
 
-  BlockServiceEventRef* = ref object of RootObj
-    slot*: Slot
-    proposers*: seq[ValidatorPubKey]
-
   RegistrationKind* {.pure.} = enum
-    Cached, IncorrectTime, MissingIndex, MissingFee, MissingGasLimit
-      ErrorSignature, NoSignature
+    Cached, IncorrectTime, MissingIndex, MissingFee, MissingGasLimit,
+    ErrorSignature, NoSignature
 
   PendingValidatorRegistration* = object
     registration*: SignedValidatorRegistrationV1
@@ -64,7 +64,7 @@ type
   DutiesServiceRef* = ref object of ClientServiceRef
 
   FallbackServiceRef* = ref object of ClientServiceRef
-    onlineEvent*: AsyncEvent
+    changesEvent*: AsyncEvent
 
   ForkServiceRef* = ref object of ClientServiceRef
 
@@ -81,7 +81,7 @@ type
     epoch*: Epoch
     dependentRoot*: Eth2Digest
     data*: RestAttesterDuty
-    slotSig*: Option[ValidatorSig]
+    slotSig*: Opt[ValidatorSig]
 
   SyncCommitteeDuty* = object
     pubkey*: ValidatorPubKey
@@ -111,10 +111,10 @@ type
   BeaconNodeServer* = object
     client*: RestClientRef
     endpoint*: string
-    config*: Option[RestSpecVC]
-    ident*: Option[string]
-    genesis*: Option[RestGenesis]
-    syncInfo*: Option[RestSyncInfo]
+    config*: Opt[RestSpecVC]
+    ident*: Opt[string]
+    genesis*: Opt[RestGenesis]
+    syncInfo*: Opt[RestSyncInfo]
     status*: RestBeaconNodeStatus
     roles*: set[BeaconNodeRole]
     logIdent*: string
@@ -127,7 +127,19 @@ type
     duties*: Table[Epoch, SyncCommitteeDuty]
 
   RestBeaconNodeStatus* {.pure.} = enum
-    Uninitalized, Offline, Incompatible, NotSynced, Online
+    Offline,            ## BN is offline.
+    Online,             ## BN is online, passed checkOnline() check.
+    Incompatible,       ## BN configuration is NOT compatible with VC.
+    Compatible,         ## BN configuration is compatible with VC configuration.
+    NotSynced,          ## BN is not in sync.
+    OptSynced,          ## BN is optimistically synced (EL is not in sync).
+    Synced,             ## BN and EL are synced.
+    UnexpectedCode,     ## BN sends unexpected/incorrect HTTP status code .
+    UnexpectedResponse, ## BN sends unexpected/incorrect response.
+    InternalError       ## BN reports internal error.
+
+  BeaconNodesCounters* = object
+    data*: array[int(high(RestBeaconNodeStatus)) + 1, int]
 
   BeaconNodeServerRef* = ref BeaconNodeServer
 
@@ -141,9 +153,17 @@ type
   DoppelgangerAttempt* {.pure.} = enum
     None, Failure, SuccessTrue, SuccessFalse
 
+  BlockWaiter* = object
+    future*: Future[seq[Eth2Digest]]
+    count*: int
+
+  BlockDataItem* = object
+    blocks: seq[Eth2Digest]
+    waiters*: seq[BlockWaiter]
+
   ValidatorClient* = object
     config*: ValidatorClientConf
-    metricsServer*: Option[MetricsHttpServerRef]
+    metricsServer*: Opt[MetricsHttpServerRef]
     graffitiBytes*: GraffitiBytes
     beaconNodes*: seq[BeaconNodeServerRef]
     fallbackService*: FallbackServiceRef
@@ -163,6 +183,8 @@ type
     beaconClock*: BeaconClock
     attachedValidators*: ref ValidatorPool
     forks*: seq[Fork]
+    preGenesisEvent*: AsyncEvent
+    genesisEvent*: AsyncEvent
     forksAvailable*: AsyncEvent
     nodesAvailable*: AsyncEvent
     indicesAvailable*: AsyncEvent
@@ -174,15 +196,32 @@ type
     proposerTasks*: Table[Slot, seq[ProposerTask]]
     dynamicFeeRecipientsStore*: ref DynamicFeeRecipientsStore
     validatorsRegCache*: Table[ValidatorPubKey, SignedValidatorRegistrationV1]
+    blocksSeen*: Table[Slot, BlockDataItem]
     rng*: ref HmacDrbgContext
+
+  ApiStrategyKind* {.pure.} = enum
+    Priority, Best, First
+
+  ApiFailure* {.pure.} = enum
+    Communication, Invalid, NotFound, OptSynced, NotSynced, Internal,
+    UnexpectedCode, UnexpectedResponse, NoError
+
+  ApiNodeFailure* = object
+    node*: BeaconNodeServerRef
+    request*: string
+    strategy*: Opt[ApiStrategyKind]
+    failure*: ApiFailure
+    status*: Opt[int]
+    reason*: string
 
   ValidatorClientRef* = ref ValidatorClient
 
   ValidatorClientError* = object of CatchableError
   ValidatorApiError* = object of ValidatorClientError
+    data*: seq[ApiNodeFailure]
 
 const
-  DefaultDutyAndProof* = DutyAndProof(epoch: Epoch(0xFFFF_FFFF_FFFF_FFFF'u64))
+  DefaultDutyAndProof* = DutyAndProof(epoch: FAR_FUTURE_EPOCH)
   SlotDuration* = int64(SECONDS_PER_SLOT).seconds
   OneThirdDuration* = int64(SECONDS_PER_SLOT).seconds div INTERVALS_PER_SLOT
   AllBeaconNodeRoles* = {
@@ -195,6 +234,18 @@ const
     BeaconNodeRole.BlockProposalPublish,
     BeaconNodeRole.SyncCommitteeData,
     BeaconNodeRole.SyncCommitteePublish,
+  }
+  AllBeaconNodeStatuses* = {
+    RestBeaconNodeStatus.Offline,
+    RestBeaconNodeStatus.Online,
+    RestBeaconNodeStatus.Incompatible,
+    RestBeaconNodeStatus.Compatible,
+    RestBeaconNodeStatus.NotSynced,
+    RestBeaconNodeStatus.OptSynced,
+    RestBeaconNodeStatus.Synced,
+    RestBeaconNodeStatus.UnexpectedCode,
+    RestBeaconNodeStatus.UnexpectedResponse,
+    RestBeaconNodeStatus.InternalError
   }
 
 proc `$`*(roles: set[BeaconNodeRole]): string =
@@ -224,6 +275,85 @@ proc `$`*(roles: set[BeaconNodeRole]): string =
       "{all}"
   else:
     "{}"
+
+proc `$`*(status: RestBeaconNodeStatus): string =
+  case status
+  of RestBeaconNodeStatus.Offline: "offline"
+  of RestBeaconNodeStatus.Online: "online"
+  of RestBeaconNodeStatus.Incompatible: "incompatible"
+  of RestBeaconNodeStatus.Compatible: "compatible"
+  of RestBeaconNodeStatus.NotSynced: "bn-unsynced"
+  of RestBeaconNodeStatus.OptSynced: "el-unsynced"
+  of RestBeaconNodeStatus.Synced: "synced"
+  of RestBeaconNodeStatus.UnexpectedCode: "unexpected code"
+  of RestBeaconNodeStatus.UnexpectedResponse: "unexpected data"
+  of RestBeaconNodeStatus.InternalError: "internal error"
+
+proc `$`*(failure: ApiFailure): string =
+  case failure
+  of ApiFailure.Communication: "communication"
+  of ApiFailure.Invalid: "invalid-request"
+  of ApiFailure.NotFound: "not-found"
+  of ApiFailure.NotSynced: "not-synced"
+  of ApiFailure.OptSynced: "opt-synced"
+  of ApiFailure.Internal: "internal-issue"
+  of ApiFailure.UnexpectedCode: "unexpected-code"
+  of ApiFailure.UnexpectedResponse: "unexpected-data"
+  of ApiFailure.NoError: "status-update"
+
+proc getNodeCounts*(vc: ValidatorClientRef): BeaconNodesCounters =
+  var res = BeaconNodesCounters()
+  for node in vc.beaconNodes: inc(res.data[int(node.status)])
+  res
+
+proc hash*(f: ApiNodeFailure): Hash =
+  hash(f.failure)
+
+proc toString*(strategy: ApiStrategyKind): string =
+  case strategy
+  of ApiStrategyKind.First:
+    "first"
+  of ApiStrategyKind.Best:
+    "best"
+  of ApiStrategyKind.Priority:
+    "priority"
+
+func getFailureReason*(failure: ApiNodeFailure): string =
+  let status =
+    if failure.status.isSome():
+      Base10.toString(uint32(failure.status.get()))
+    else:
+      "n/a"
+  let request =
+    if failure.strategy.isSome():
+      failure.request & "(" & failure.strategy.get().toString() & ")"
+    else:
+      failure.request & "()"
+  [failure.reason, status, request, $failure.failure].join(";")
+
+proc getFailureReason*(exc: ref ValidatorApiError): string =
+  var counts: array[int(high(ApiFailure)) + 1, int]
+  let
+    errors = exc[].data
+    errorsCount = len(errors)
+
+  if errorsCount > 1:
+    let distinctErrors =
+      block:
+        var res: seq[ApiNodeFailure]
+        for item in errors.toHashSet().items():
+          res.add(item)
+        res
+    if len(distinctErrors) > 1:
+      # If we have many unique errors, we going to report only failures,
+      # full reasons could be obtained via previosly made log statements.
+      "[" & distinctErrors.mapIt($it.failure).join(",") & "]"
+    else:
+      getFailureReason(distinctErrors[0])
+  elif errorsCount == 1:
+    getFailureReason(errors[0])
+  else:
+    exc.msg
 
 proc shortLog*(roles: set[BeaconNodeRole]): string =
   var r = "AGBSD"
@@ -255,10 +385,19 @@ proc `$`*(bn: BeaconNodeServerRef): string =
     bn.logIdent
 
 proc validatorLog*(key: ValidatorPubKey,
-                  index: ValidatorIndex): string =
+                   index: ValidatorIndex): string =
   var res = shortLog(key)
   res.add('@')
   res.add(Base10.toString(uint64(index)))
+  res
+
+proc validatorLog*(validator: AttachedValidator): string =
+  var res = shortLog(validator)
+  res.add('@')
+  if validator.index.isSome():
+    res.add(Base10.toString(uint64(validator.index.get())))
+  else:
+    res.add("<missing>")
   res
 
 chronicles.expandIt(BeaconNodeServerRef):
@@ -279,6 +418,101 @@ chronicles.expandIt(SyncCommitteeDuty):
   pubkey = shortLog(it.pubkey)
   validator_index = it.validator_index
   validator_sync_committee_index = it.validator_sync_committee_index
+
+proc checkConfig*(info: RestSpecVC): bool =
+  # /!\ Keep in sync with `spec/eth2_apis/rest_types.nim` > `RestSpecVC`.
+  info.MAX_VALIDATORS_PER_COMMITTEE == MAX_VALIDATORS_PER_COMMITTEE and
+  info.SLOTS_PER_EPOCH == SLOTS_PER_EPOCH and
+  info.SECONDS_PER_SLOT == SECONDS_PER_SLOT and
+  info.EPOCHS_PER_ETH1_VOTING_PERIOD == EPOCHS_PER_ETH1_VOTING_PERIOD and
+  info.SLOTS_PER_HISTORICAL_ROOT == SLOTS_PER_HISTORICAL_ROOT and
+  info.EPOCHS_PER_HISTORICAL_VECTOR == EPOCHS_PER_HISTORICAL_VECTOR and
+  info.EPOCHS_PER_SLASHINGS_VECTOR == EPOCHS_PER_SLASHINGS_VECTOR and
+  info.HISTORICAL_ROOTS_LIMIT == HISTORICAL_ROOTS_LIMIT and
+  info.VALIDATOR_REGISTRY_LIMIT == VALIDATOR_REGISTRY_LIMIT and
+  info.MAX_PROPOSER_SLASHINGS == MAX_PROPOSER_SLASHINGS and
+  info.MAX_ATTESTER_SLASHINGS == MAX_ATTESTER_SLASHINGS and
+  info.MAX_ATTESTATIONS == MAX_ATTESTATIONS and
+  info.MAX_DEPOSITS == MAX_DEPOSITS and
+  info.MAX_VOLUNTARY_EXITS == MAX_VOLUNTARY_EXITS and
+  info.DOMAIN_BEACON_PROPOSER == DOMAIN_BEACON_PROPOSER and
+  info.DOMAIN_BEACON_ATTESTER == DOMAIN_BEACON_ATTESTER and
+  info.DOMAIN_RANDAO == DOMAIN_RANDAO and
+  info.DOMAIN_DEPOSIT == DOMAIN_DEPOSIT and
+  info.DOMAIN_VOLUNTARY_EXIT == DOMAIN_VOLUNTARY_EXIT and
+  info.DOMAIN_SELECTION_PROOF == DOMAIN_SELECTION_PROOF and
+  info.DOMAIN_AGGREGATE_AND_PROOF == DOMAIN_AGGREGATE_AND_PROOF
+
+proc updateStatus*(node: BeaconNodeServerRef,
+                   status: RestBeaconNodeStatus,
+                   failure: ApiNodeFailure) =
+  logScope:
+    node = node
+
+  case status
+  of RestBeaconNodeStatus.Offline:
+    if node.status != status:
+      warn "Beacon node down",
+           reason = failure.getFailureReason()
+      node.status = status
+  of RestBeaconNodeStatus.Online:
+    if node.status != status:
+      let version = if node.ident.isSome(): node.ident.get() else: "<missing>"
+      notice "Beacon node is online", agent_version = version
+      node.status = status
+  of RestBeaconNodeStatus.Incompatible:
+    if node.status != status:
+      warn "Beacon node has incompatible configuration",
+           reason = failure.getFailureReason()
+      node.status = status
+  of RestBeaconNodeStatus.Compatible:
+    if node.status != status:
+      notice "Beacon node is compatible"
+      node.status = status
+  of RestBeaconNodeStatus.NotSynced:
+    if node.status notin {RestBeaconNodeStatus.NotSynced,
+                          RestBeaconNodeStatus.OptSynced}:
+      doAssert(node.syncInfo.isSome())
+      let si = node.syncInfo.get()
+      warn "Beacon node not in sync", reason = failure.getFailureReason(),
+           last_head_slot = si.head_slot,
+           last_sync_distance = si.sync_distance,
+           last_optimistic = si.is_optimistic.get(false)
+      node.status = status
+  of RestBeaconNodeStatus.OptSynced:
+    if node.status != status:
+      doAssert(node.syncInfo.isSome())
+      let si = node.syncInfo.get()
+      notice "Beacon node optimistically synced (Execution client not in sync)",
+             reason = failure.getFailureReason(),
+             last_head_slot = si.head_slot,
+             last_sync_distance = si.sync_distance,
+             last_optimistic = si.is_optimistic.get(false)
+      node.status = status
+  of RestBeaconNodeStatus.Synced:
+    if node.status != status:
+      doAssert(node.syncInfo.isSome())
+      let si = node.syncInfo.get()
+      notice "Beacon node is in sync",
+             head_slot = si.head_slot,
+             sync_distance = si.sync_distance,
+             is_optimistic = si.is_optimistic.get(false)
+      node.status = status
+  of RestBeaconNodeStatus.UnexpectedResponse:
+    if node.status != status:
+      error "Beacon node provides unexpected response",
+            reason = failure.getFailureReason()
+      node.status = status
+  of RestBeaconNodeStatus.UnexpectedCode:
+    if node.status != status:
+      error "Beacon node provides unexpected status code",
+            reason = failure.getFailureReason()
+      node.status = status
+  of RestBeaconNodeStatus.InternalError:
+    if node.status != status:
+      warn "Beacon node reports internal error",
+           reason = failure.getFailureReason()
+      node.status = status
 
 proc stop*(csr: ClientServiceRef) {.async.} =
   debug "Stopping service", service = csr.name
@@ -343,26 +577,59 @@ proc parseRoles*(data: string): Result[set[BeaconNodeRole], cstring] =
       return err("Invalid beacon node role string found")
   ok(res)
 
+proc normalizeUri*(r: Uri): Result[Uri, cstring] =
+  const
+    MissingPortNumber = cstring("Missing port number")
+    MissingHostname = cstring("Missing hostname")
+    UnknownScheme = cstring("Unknown scheme value")
+
+  if ($r).toLowerAscii().startsWith("http://") or
+     ($r).toLowerAscii().startsWith("https://"):
+    # When a scheme is provided, only a hostname is required
+    if len(r.hostname) == 0: return err(MissingHostname)
+    return ok(r)
+
+  # Check for unknown scheme
+  if ($r).contains("://"):
+    return err(UnknownScheme)
+
+  # Add the default scheme (http)
+  let normalized =
+    if ($r).startsWith("//"):
+      parseUri("http:" & $r)
+    else:
+      parseUri("http://" & $r)
+
+  if len(normalized.hostname) == 0:
+    return err(MissingHostname)
+
+  if len(normalized.port) == 0:
+    return err(MissingPortNumber)
+
+  ok(normalized)
+
 proc init*(t: typedesc[BeaconNodeServerRef], remote: Uri,
            index: int): Result[BeaconNodeServerRef, string] =
   doAssert(index >= 0)
   let
     flags = {RestClientFlag.CommaSeparatedArray}
+    remoteUri = normalizeUri(remote).valueOr:
+      return err("Invalid URL: " & $error)
     client =
       block:
-        let res = RestClientRef.new($remote, flags = flags)
+        let res = RestClientRef.new($remoteUri, flags = flags)
         if res.isErr(): return err($res.error())
         res.get()
     roles =
       block:
-        let res = parseRoles(remote.anchor)
+        let res = parseRoles(remoteUri.anchor)
         if res.isErr(): return err($res.error())
         res.get()
 
   let server = BeaconNodeServerRef(
-    client: client, endpoint: $remote, index: index, roles: roles,
-    logIdent: client.address.hostname & ":" &
-              Base10.toString(client.address.port)
+    client: client, endpoint: $remoteUri, index: index, roles: roles,
+    logIdent: $client.address.getUri(),
+    status: RestBeaconNodeStatus.Offline
   )
   ok(server)
 
@@ -374,7 +641,7 @@ proc getMissingRoles*(n: openArray[BeaconNodeServerRef]): set[BeaconNodeRole] =
 
 proc init*(t: typedesc[DutyAndProof], epoch: Epoch, dependentRoot: Eth2Digest,
            duty: RestAttesterDuty,
-           slotSig: Option[ValidatorSig]): DutyAndProof =
+           slotSig: Opt[ValidatorSig]): DutyAndProof =
   DutyAndProof(epoch: epoch, dependentRoot: dependentRoot, data: duty,
                slotSig: slotSig)
 
@@ -382,18 +649,12 @@ proc init*(t: typedesc[ProposedData], epoch: Epoch, dependentRoot: Eth2Digest,
            data: openArray[ProposerTask]): ProposedData =
   ProposedData(epoch: epoch, dependentRoot: dependentRoot, duties: @data)
 
-proc getCurrentSlot*(vc: ValidatorClientRef): Option[Slot] =
-  let
-    wallTime = vc.beaconClock.now()
-    wallSlot = wallTime.toSlot()
-
-  if not(wallSlot.afterGenesis):
-    let checkGenesisTime = vc.beaconClock.fromNow(start_beacon_time(Slot(0)))
-    warn "Jump in time detected, something wrong with wallclock",
-         wall_time = wallTime, genesisIn = checkGenesisTime.offset
-    none[Slot]()
+proc getCurrentSlot*(vc: ValidatorClientRef): Opt[Slot] =
+  let res = vc.beaconClock.now().toSlot()
+  if res.afterGenesis:
+    Opt.some(res.slot)
   else:
-    some(wallSlot.slot)
+    Opt.none(Slot)
 
 proc getAttesterDutiesForSlot*(vc: ValidatorClientRef,
                                slot: Slot): seq[DutyAndProof] =
@@ -484,8 +745,9 @@ proc getDelay*(vc: ValidatorClientRef, deadline: BeaconTime): TimeDiff =
   vc.beaconClock.now() - deadline
 
 proc getValidatorForDuties*(vc: ValidatorClientRef,
-                            key: ValidatorPubKey, slot: Slot): Opt[AttachedValidator] =
-  vc.attachedValidators[].getValidatorForDuties(key, slot)
+                            key: ValidatorPubKey, slot: Slot,
+                            slashingSafe = false): Opt[AttachedValidator] =
+  vc.attachedValidators[].getValidatorForDuties(key, slot, slashingSafe)
 
 proc forkAtEpoch*(vc: ValidatorClientRef, epoch: Epoch): Fork =
   # If schedule is present, it MUST not be empty.
@@ -507,9 +769,16 @@ proc currentSlot*(vc: ValidatorClientRef): Slot =
 proc addValidator*(vc: ValidatorClientRef, keystore: KeystoreData) =
   let
     slot = vc.currentSlot()
+    withdrawalAddress =
+      if vc.keymanagerHost.isNil:
+        Opt.none Eth1Address
+      else:
+        vc.keymanagerHost[].getValidatorWithdrawalAddress(keystore.pubkey)
+    perValidatorDefaultFeeRecipient = getPerValidatorDefaultFeeRecipient(
+      vc.config.defaultFeeRecipient, withdrawalAddress)
     feeRecipient = vc.config.validatorsDir.getSuggestedFeeRecipient(
-      keystore.pubkey, vc.config.defaultFeeRecipient).valueOr(
-        vc.config.defaultFeeRecipient)
+      keystore.pubkey, perValidatorDefaultFeeRecipient).valueOr(
+        perValidatorDefaultFeeRecipient)
     gasLimit = vc.config.validatorsDir.getSuggestedGasLimit(
       keystore.pubkey, vc.config.suggestedGasLimit).valueOr(
         vc.config.suggestedGasLimit)
@@ -518,22 +787,23 @@ proc addValidator*(vc: ValidatorClientRef, keystore: KeystoreData) =
 
 proc removeValidator*(vc: ValidatorClientRef,
                       pubkey: ValidatorPubKey) {.async.} =
-  let validator = vc.attachedValidators[].getValidator(pubkey)
-  if not(isNil(validator)):
-    case validator.kind
-    of ValidatorKind.Local:
-      discard
-    of ValidatorKind.Remote:
-      # We must close all the REST clients running for the remote validator.
-      let pending =
-        block:
-          var res: seq[Future[void]]
-          for item in validator.clients:
-            res.add(item[0].closeWait())
-          res
-      await allFutures(pending)
-    # Remove validator from ValidatorPool.
-    vc.attachedValidators[].removeValidator(pubkey)
+  let validator = vc.attachedValidators[].getValidator(pubkey).valueOr:
+    return
+  # Remove validator from ValidatorPool.
+  vc.attachedValidators[].removeValidator(pubkey)
+
+  case validator.kind
+  of ValidatorKind.Local:
+    discard
+  of ValidatorKind.Remote:
+    # We must close all the REST clients running for the remote validator.
+    let pending =
+      block:
+        var res: seq[Future[void]]
+        for item in validator.clients:
+          res.add(item[0].closeWait())
+        res
+    await allFutures(pending)
 
 proc getFeeRecipient*(vc: ValidatorClientRef, pubkey: ValidatorPubKey,
                       validatorIdx: ValidatorIndex,
@@ -543,8 +813,16 @@ proc getFeeRecipient*(vc: ValidatorClientRef, pubkey: ValidatorPubKey,
   if dynamicRecipient.isSome():
     Opt.some(dynamicRecipient.get())
   else:
-    let staticRecipient = getSuggestedFeeRecipient(
-      vc.config.validatorsDir, pubkey, vc.config.defaultFeeRecipient)
+    let
+      withdrawalAddress =
+        if vc.keymanagerHost.isNil:
+          Opt.none Eth1Address
+        else:
+          vc.keymanagerHost[].getValidatorWithdrawalAddress(pubkey)
+      perValidatorDefaultFeeRecipient = getPerValidatorDefaultFeeRecipient(
+        vc.config.defaultFeeRecipient, withdrawalAddress)
+      staticRecipient = getSuggestedFeeRecipient(
+        vc.config.validatorsDir, pubkey, perValidatorDefaultFeeRecipient)
     if staticRecipient.isOk():
       Opt.some(staticRecipient.get())
     else:
@@ -639,7 +917,7 @@ proc getValidatorRegistration(
     let sigfut = validator.getBuilderSignature(fork, registration.message)
     if sigfut.finished():
       # This is short-path if we able to create signature locally.
-      if not(sigfut.done()):
+      if not(sigfut.completed()):
         let exc = sigfut.readError()
         debug "Got unexpected exception while signing validator registration",
               validator = shortLog(validator), error_name = $exc.name,
@@ -707,7 +985,7 @@ proc prepareRegistrationList*(
     await allFutures(futures)
 
   for index, future in futures.pairs():
-    if future.done():
+    if future.completed():
       let sres = future.read()
       if sres.isOk():
         var reg = messages[index]
@@ -727,3 +1005,233 @@ proc prepareRegistrationList*(
         incorrect_time = timed
 
   return registrations
+
+func init*(t: typedesc[ApiNodeFailure], failure: ApiFailure,
+           request: string, strategy: ApiStrategyKind,
+           node: BeaconNodeServerRef): ApiNodeFailure =
+  ApiNodeFailure(node: node, request: request, strategy: Opt.some(strategy),
+                 failure: failure)
+
+func init*(t: typedesc[ApiNodeFailure], failure: ApiFailure,
+           request: string, strategy: ApiStrategyKind,
+           node: BeaconNodeServerRef, reason: string): ApiNodeFailure =
+  ApiNodeFailure(node: node, request: request, strategy: Opt.some(strategy),
+                 failure: failure, reason: reason)
+
+func init*(t: typedesc[ApiNodeFailure], failure: ApiFailure,
+           request: string, strategy: ApiStrategyKind,
+           node: BeaconNodeServerRef, status: int,
+           reason: string): ApiNodeFailure =
+  ApiNodeFailure(node: node, request: request, strategy: Opt.some(strategy),
+                 failure: failure, status: Opt.some(status), reason: reason)
+
+func init*(t: typedesc[ApiNodeFailure], failure: ApiFailure,
+           request: string, node: BeaconNodeServerRef, status: int,
+           reason: string): ApiNodeFailure =
+  ApiNodeFailure(node: node, request: request,
+                 failure: failure, status: Opt.some(status), reason: reason)
+
+func init*(t: typedesc[ApiNodeFailure], failure: ApiFailure,
+           request: string, node: BeaconNodeServerRef,
+           reason: string): ApiNodeFailure =
+  ApiNodeFailure(node: node, request: request, failure: failure, reason: reason)
+
+proc checkedWaitForSlot*(vc: ValidatorClientRef, destinationSlot: Slot,
+                         offset: TimeDiff,
+                         showLogs: bool): Future[Opt[Slot]] {.async.} =
+  let
+    currentTime = vc.beaconClock.now()
+    currentSlot = currentTime.slotOrZero()
+    chronosOffset = chronos.nanoseconds(
+      if offset.nanoseconds < 0: 0'i64 else: offset.nanoseconds)
+
+  var timeToSlot = (destinationSlot.start_beacon_time() - currentTime) +
+                   chronosOffset
+
+  logScope:
+    start_time = shortLog(currentTime)
+    start_slot = shortLog(currentSlot)
+    dest_slot = shortLog(destinationSlot)
+    time_to_slot = shortLog(timeToSlot)
+
+  while true:
+    await sleepAsync(timeToSlot)
+
+    let
+      wallTime = vc.beaconClock.now()
+      wallSlot = wallTime.slotOrZero()
+
+    logScope:
+      wall_time = shortLog(wallTime)
+      wall_slot = shortLog(wallSlot)
+
+    if wallSlot < destinationSlot:
+      # While we were sleeping, the system clock changed and time moved
+      # backwards!
+      if wallSlot + 1 < destinationSlot:
+        # This is a critical condition where it's hard to reason about what
+        # to do next - we'll call the attention of the user here by shutting
+        # down.
+        if showLogs:
+          fatal "System time adjusted backwards significantly - " &
+                "clock may be inaccurate - shutting down"
+        return Opt.none(Slot)
+      else:
+        # Time moved back by a single slot - this could be a minor adjustment,
+        # for example when NTP does its thing after not working for a while
+        timeToSlot = destinationSlot.start_beacon_time() - wallTime +
+                     chronosOffset
+        if showLogs:
+          warn "System time adjusted backwards, rescheduling slot actions"
+        continue
+
+    elif wallSlot > destinationSlot + SLOTS_PER_EPOCH:
+      if showLogs:
+        warn "Time moved forwards by more than an epoch, skipping ahead"
+      return Opt.some(wallSlot)
+
+    elif wallSlot > destinationSlot:
+      if showLogs:
+        notice "Missed expected slot start, catching up"
+      return Opt.some(wallSlot)
+
+    else:
+      return Opt.some(destinationSlot)
+
+proc checkedWaitForNextSlot*(vc: ValidatorClientRef, curSlot: Opt[Slot],
+                             offset: TimeDiff,
+                             showLogs: bool): Future[Opt[Slot]] =
+  let
+    currentTime = vc.beaconClock.now()
+    currentSlot = curSlot.valueOr: currentTime.slotOrZero()
+    nextSlot = currentSlot + 1
+
+  vc.checkedWaitForSlot(nextSlot, offset, showLogs)
+
+proc checkedWaitForNextSlot*(vc: ValidatorClientRef, offset: TimeDiff,
+                             showLogs: bool): Future[Opt[Slot]] =
+  let
+    currentTime = vc.beaconClock.now()
+    currentSlot = currentTime.slotOrZero()
+    nextSlot = currentSlot + 1
+
+  vc.checkedWaitForSlot(nextSlot, offset, showLogs)
+
+proc expectBlock*(vc: ValidatorClientRef, slot: Slot,
+                  confirmations: int = 1): Future[seq[Eth2Digest]] =
+  var
+    retFuture = newFuture[seq[Eth2Digest]]("expectBlock")
+    waiter = BlockWaiter(future: retFuture, count: confirmations)
+
+  proc cancellation(udata: pointer) =
+    vc.blocksSeen.withValue(slot, adata):
+      adata[].waiters.keepItIf(it.future != retFuture)
+
+  proc scheduleCallbacks(data: var BlockDataItem,
+                         waiter: BlockWaiter) =
+    data.waiters.add(waiter)
+    for mitem in data.waiters.mitems():
+      if mitem.count <= len(data.blocks):
+        if not(mitem.future.finished()): mitem.future.complete(data.blocks)
+
+  vc.blocksSeen.mgetOrPut(slot, BlockDataItem()).scheduleCallbacks(waiter)
+  if not(retFuture.finished()): retFuture.cancelCallback = cancellation
+  retFuture
+
+proc registerBlock*(vc: ValidatorClientRef, data: EventBeaconBlockObject) =
+  let
+    wallTime = vc.beaconClock.now()
+    delay = wallTime - data.slot.start_beacon_time()
+
+  debug "Block received", slot = data.slot,
+        block_root = shortLog(data.block_root), optimistic = data.optimistic,
+        delay = delay
+
+  proc scheduleCallbacks(data: var BlockDataItem,
+                         blck: EventBeaconBlockObject) =
+    data.blocks.add(blck.block_root)
+    for mitem in data.waiters.mitems():
+      if mitem.count >= len(data.blocks):
+        if not(mitem.future.finished()): mitem.future.complete(data.blocks)
+  vc.blocksSeen.mgetOrPut(data.slot, BlockDataItem()).scheduleCallbacks(data)
+
+proc pruneBlocksSeen*(vc: ValidatorClientRef, epoch: Epoch) =
+  var blocksSeen: Table[Slot, BlockDataItem]
+  for slot, item in vc.blocksSeen.pairs():
+    if (slot.epoch() + HISTORICAL_DUTIES_EPOCHS) >= epoch:
+      blocksSeen[slot] = item
+    else:
+      let blockRoot =
+        if len(item.blocks) == 0:
+          "<missing>"
+        elif len(item.blocks) == 1:
+          shortLog(item.blocks[0])
+        else:
+          "[" & item.blocks.mapIt(shortLog(it)).join(", ") & "]"
+      debug "Block data has been pruned", slot = slot, blocks = blockRoot
+  vc.blocksSeen = blocksSeen
+
+proc waitForBlock*(
+       vc: ValidatorClientRef,
+       slot: Slot,
+       timediff: TimeDiff,
+       confirmations: int = 1
+     ) {.async.} =
+  ## This procedure will wait for a block proposal for a ``slot`` received
+  ## by the beacon node.
+  let
+    startTime = Moment.now()
+    waitTime = (start_beacon_time(slot) + timediff) - vc.beaconClock.now()
+
+  logScope:
+    slot = slot
+    timediff = timediff
+    wait_time = waitTime
+
+  debug "Waiting for block proposal"
+
+  if waitTime.nanoseconds <= 0'i64:
+    # We do not have time to wait for block.
+    return
+
+  let blocks =
+    try:
+      let timeout = nanoseconds(waitTime.nanoseconds)
+      await vc.expectBlock(slot, confirmations).wait(timeout)
+    except AsyncTimeoutError:
+      let dur = Moment.now() - startTime
+      debug "Block has not been received in time", duration = dur
+      return
+    except CancelledError as exc:
+      let dur = Moment.now() - startTime
+      debug "Block awaiting was interrupted", duration = dur
+      raise exc
+    except CatchableError as exc:
+      let dur = Moment.now() - startTime
+      error "Unexpected error occured while waiting for block publication",
+            err_name = exc.name, err_msg = exc.msg, duration = dur
+      return
+
+  let
+    dur = Moment.now() - startTime
+    blockRoot =
+      if len(blocks) == 0:
+        "<missing>"
+      elif len(blocks) == 1:
+        shortLog(blocks[0])
+      else:
+        "[" & blocks.mapIt(shortLog(it)).join(", ") & "]"
+
+  debug "Block proposal awaited", duration = dur,
+        block_root = blockRoot
+
+  try:
+    await waitAfterBlockCutoff(vc.beaconClock, slot)
+  except CancelledError as exc:
+    let dur = Moment.now() - startTime
+    debug "Waiting for block cutoff was interrupted", duration = dur
+    raise exc
+
+iterator chunks*[T](data: openArray[T], maxCount: Positive): seq[T] =
+  for i in countup(0, len(data) - 1, maxCount):
+    yield @(data.toOpenArray(i, min(i + maxCount, len(data)) - 1))

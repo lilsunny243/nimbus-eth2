@@ -30,10 +30,13 @@ func match(data: openArray[char], charset: set[char]): int =
       return 1
   0
 
-proc getSyncedHead*(node: BeaconNode, slot: Slot): Result[BlockRef, cstring] =
+proc getSyncedHead*(
+       node: BeaconNode,
+       slot: Slot
+     ): Result[BlockRef, cstring] =
   let head = node.dag.head
 
-  if node.isSynced(head) != SyncStatus.synced:
+  if not node.isSynced(head):
     return err("Beacon node not fully and non-optimistically synced")
 
   # Enough ahead not to know the shuffling
@@ -49,8 +52,10 @@ func getCurrentSlot*(node: BeaconNode, slot: Slot):
   else:
     err("Requesting slot too far ahead of the current head")
 
-proc getSyncedHead*(node: BeaconNode,
-                    epoch: Epoch): Result[BlockRef, cstring] =
+proc getSyncedHead*(
+       node: BeaconNode,
+       epoch: Epoch,
+     ): Result[BlockRef, cstring] =
   if epoch > MaxEpoch:
     return err("Requesting epoch for which slot would overflow")
   node.getSyncedHead(epoch.start_slot())
@@ -222,7 +227,7 @@ func syncCommitteeParticipants*(forkedState: ForkedHashedBeaconState,
                                 epoch: Epoch
                                ): Result[seq[ValidatorPubKey], cstring] =
   withState(forkedState):
-    when stateFork >= ConsensusFork.Altair:
+    when consensusFork >= ConsensusFork.Altair:
       let
         epochPeriod = sync_committee_period(epoch)
         curPeriod = sync_committee_period(forkyState.data.slot)
@@ -261,23 +266,26 @@ func keysToIndices*(cacheTable: var Table[ValidatorPubKey, ValidatorIndex],
         indices[listIndex[]] = some(ValidatorIndex(validatorIndex))
   indices
 
+proc getShufflingOptimistic*(node: BeaconNode,
+                             dependentSlot: Slot,
+                             dependentRoot: Eth2Digest): Option[bool] =
+  if node.currentSlot().epoch() >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
+    # `slot` in this `BlockId` may be higher than block's actual slot,
+    # this is alright for the purpose of calling `is_optimistic`.
+    let bid = BlockId(slot: dependentSlot, root: dependentRoot)
+    some[bool](node.dag.is_optimistic(bid))
+  else:
+    none[bool]()
+
 proc getStateOptimistic*(node: BeaconNode,
                          state: ForkedHashedBeaconState): Option[bool] =
   if node.currentSlot().epoch() >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
-    case state.kind
-    of ConsensusFork.Phase0, ConsensusFork.Altair:
-      some[bool](false)
-    of  ConsensusFork.Bellatrix, ConsensusFork.Capella,
-        ConsensusFork.EIP4844:
+    if state.kind >= ConsensusFork.Bellatrix:
       # A state is optimistic iff the block which created it is
-      withState(state):
-        # The block root which created the state at slot `n` is at slot `n-1`
-        if forkyState.data.slot == GENESIS_SLOT:
-          some[bool](false)
-        else:
-          doAssert forkyState.data.slot > 0
-          some[bool](node.dag.is_optimistic(
-            get_block_root_at_slot(forkyState.data, forkyState.data.slot - 1)))
+      let stateBid = withState(state): forkyState.latest_block_id
+      some[bool](node.dag.is_optimistic(stateBid))
+    else:
+      some[bool](false)
   else:
     none[bool]()
 
@@ -285,21 +293,12 @@ proc getBlockOptimistic*(node: BeaconNode,
                          blck: ForkedTrustedSignedBeaconBlock |
                                ForkedSignedBeaconBlock): Option[bool] =
   if node.currentSlot().epoch() >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
-    case blck.kind
-    of ConsensusFork.Phase0, ConsensusFork.Altair:
+    if blck.kind >= ConsensusFork.Bellatrix:
+      some[bool](node.dag.is_optimistic(blck.toBlockId()))
+    else:
       some[bool](false)
-    of ConsensusFork.Bellatrix, ConsensusFork.Capella, ConsensusFork.EIP4844:
-      some[bool](node.dag.is_optimistic(blck.root))
   else:
     none[bool]()
-
-proc getBlockRefOptimistic*(node: BeaconNode, blck: BlockRef): bool =
-  let blck = node.dag.getForkedBlock(blck.bid).get()
-  case blck.kind
-  of ConsensusFork.Phase0, ConsensusFork.Altair:
-    false
-  of ConsensusFork.Bellatrix, ConsensusFork.Capella, ConsensusFork.EIP4844:
-    node.dag.is_optimistic(blck.root)
 
 const
   jsonMediaType* = MediaType.init("application/json")

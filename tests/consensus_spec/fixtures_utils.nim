@@ -42,10 +42,10 @@ func readValue*(r: var JsonReader, a: var seq[byte]) =
 # #######################
 # Mock RuntimeConfig
 
-func genesisTestRuntimeConfig*(stateFork: ConsensusFork): RuntimeConfig =
+func genesisTestRuntimeConfig*(consensusFork: ConsensusFork): RuntimeConfig =
   var res = defaultRuntimeConfig
-  case stateFork
-  of ConsensusFork.EIP4844:
+  case consensusFork
+  of ConsensusFork.Deneb:
     res.DENEB_FORK_EPOCH = GENESIS_EPOCH
     res.CAPELLA_FORK_EPOCH = GENESIS_EPOCH
     res.BELLATRIX_FORK_EPOCH = GENESIS_EPOCH
@@ -70,12 +70,12 @@ type
   UnconsumedInput* = object of CatchableError
   TestSizeError* = object of ValueError
 
-  # https://github.com/ethereum/consensus-specs/tree/v1.3.0-alpha.1/tests/formats/rewards#rewards-tests
+  # https://github.com/ethereum/consensus-specs/tree/v1.3.0/tests/formats/rewards#rewards-tests
   Deltas* = object
     rewards*: List[uint64, Limit VALIDATOR_REGISTRY_LIMIT]
     penalties*: List[uint64, Limit VALIDATOR_REGISTRY_LIMIT]
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/validator.md#eth1block
+  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/validator.md#eth1block
   Eth1Block* = object
     timestamp*: uint64
     deposit_root*: Eth2Digest
@@ -122,17 +122,17 @@ proc parseTest*(path: string, Format: typedesc[SSZ], T: typedesc): T =
     quit 1
 
 from ../../beacon_chain/spec/datatypes/capella import BeaconState
-from ../../beacon_chain/spec/datatypes/eip4844 import BeaconState
+from ../../beacon_chain/spec/datatypes/deneb import BeaconState
 
 proc loadForkedState*(
     path: string, fork: ConsensusFork): ref ForkedHashedBeaconState =
   var forkedState: ref ForkedHashedBeaconState
   case fork
-  of ConsensusFork.EIP4844:
-    let state = newClone(parseTest(path, SSZ, eip4844.BeaconState))
-    forkedState = (ref ForkedHashedBeaconState)(kind: ConsensusFork.EIP4844)
-    forkedState.eip4844Data.data = state[]
-    forkedState.eip4844Data.root = hash_tree_root(state[])
+  of ConsensusFork.Deneb:
+    let state = newClone(parseTest(path, SSZ, deneb.BeaconState))
+    forkedState = (ref ForkedHashedBeaconState)(kind: ConsensusFork.Deneb)
+    forkedState.denebData.data = state[]
+    forkedState.denebData.root = hash_tree_root(state[])
   of ConsensusFork.Capella:
     let state = newClone(parseTest(path, SSZ, capella.BeaconState))
     forkedState = (ref ForkedHashedBeaconState)(kind: ConsensusFork.Capella)

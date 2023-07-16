@@ -143,6 +143,18 @@ type
     ioHandle*: IoLockHandle
     opened*: bool
 
+  RemoteSignerType* {.pure.} = enum
+    Web3Signer, VerifyingWeb3Signer
+
+  ProvenProperty* = object
+    path*: string
+    description*: Option[string]
+    phase0Index*: Option[GeneralizedIndex]
+    altairIndex*: Option[GeneralizedIndex]
+    bellatrixIndex*: Option[GeneralizedIndex]
+    capellaIndex*: Option[GeneralizedIndex]
+    denebIndex*: Option[GeneralizedIndex]
+
   KeystoreData* = object
     version*: uint64
     pubkey*: ValidatorPubKey
@@ -157,6 +169,11 @@ type
       flags*: set[RemoteKeystoreFlag]
       remotes*: seq[RemoteSignerInfo]
       threshold*: uint32
+      case remoteType*: RemoteSignerType
+      of RemoteSignerType.Web3Signer:
+        discard
+      of RemoteSignerType.VerifyingWeb3Signer:
+        provenBlockProperties*: seq[ProvenProperty]
 
   NetKeystore* = object
     crypto*: Crypto
@@ -165,13 +182,14 @@ type
     uuid*: string
     version*: int
 
-  RemoteSignerType* {.pure.} = enum
-    Web3Signer
-
   RemoteKeystore* = object
     version*: uint64
     description*: Option[string]
-    remoteType*: RemoteSignerType
+    case remoteType*: RemoteSignerType
+    of RemoteSignerType.Web3Signer:
+      discard
+    of RemoteSignerType.VerifyingWeb3Signer:
+      provenBlockProperties*: seq[ProvenProperty]
     pubkey*: ValidatorPubKey
     flags*: set[RemoteKeystoreFlag]
     remotes*: seq[RemoteSignerInfo]
@@ -538,8 +556,94 @@ proc readValue*[T: SimpleHexEncodedTypes](r: var JsonReader, value: var T) {.
   if len(seq[byte](value)) == 0:
     r.raiseUnexpectedValue("Valid hex string expected")
 
-proc readValue*(r: var JsonReader, value: var Kdf)
-               {.raises: [SerializationError, IOError, Defect].} =
+template readValueImpl(r: var JsonReader, value: var Checksum) =
+  var
+    functionSpecified = false
+    paramsSpecified = false
+    messageSpecified = false
+
+  for fieldName in readObjectFields(r):
+    case fieldName
+    of "function":
+      value = Checksum(function: r.readValue(ChecksumFunctionKind))
+      functionSpecified = true
+
+    of "params":
+      if functionSpecified:
+        case value.function
+        of sha256Checksum:
+          r.readValue(value.params)
+      else:
+        r.raiseUnexpectedValue(
+          "The 'params' field must be specified after the 'function' field")
+      paramsSpecified = true
+
+    of "message":
+      if functionSpecified:
+        case value.function
+        of sha256Checksum:
+          r.readValue(value.message)
+      else:
+        r.raiseUnexpectedValue(
+          "The 'message' field must be specified after the 'function' field")
+      messageSpecified = true
+
+    else:
+      r.raiseUnexpectedField(fieldName, "Checksum")
+
+  if not (functionSpecified and paramsSpecified and messageSpecified):
+    r.raiseUnexpectedValue(
+      "The Checksum value should have sub-fields named " &
+      "'function', 'params', and 'message'")
+
+{.push warning[ProveField]:off.}  # https://github.com/nim-lang/Nim/issues/22060
+proc readValue*(r: var JsonReader[DefaultFlavor], value: var Checksum)
+    {.raises: [SerializationError, IOError].} =
+  readValueImpl(r, value)
+{.pop.}
+
+template readValueImpl(r: var JsonReader, value: var Cipher) =
+  var
+    functionSpecified = false
+    paramsSpecified = false
+    messageSpecified = false
+
+  for fieldName in readObjectFields(r):
+    case fieldName
+    of "function":
+      value = Cipher(
+        function: r.readValue(CipherFunctionKind), message: value.message)
+      functionSpecified = true
+
+    of "params":
+      if functionSpecified:
+        case value.function
+        of aes128CtrCipher:
+          r.readValue(value.params)
+      else:
+        r.raiseUnexpectedValue(
+          "The 'params' field must be specified after the 'function' field")
+      paramsSpecified = true
+
+    of "message":
+      r.readValue(value.message)
+      messageSpecified = true
+
+    else:
+      r.raiseUnexpectedField(fieldName, "Cipher")
+
+  if not (functionSpecified and paramsSpecified and messageSpecified):
+    r.raiseUnexpectedValue(
+      "The Cipher value should have sub-fields named " &
+      "'function', 'params', and 'message'")
+
+{.push warning[ProveField]:off.}  # https://github.com/nim-lang/Nim/issues/22060
+proc readValue*(r: var JsonReader[DefaultFlavor], value: var Cipher)
+    {.raises: [SerializationError, IOError].} =
+  readValueImpl(r, value)
+{.pop.}
+
+template readValueImpl(r: var JsonReader, value: var Kdf) =
   var
     functionSpecified = false
     paramsSpecified = false
@@ -547,7 +651,7 @@ proc readValue*(r: var JsonReader, value: var Kdf)
   for fieldName in readObjectFields(r):
     case fieldName
     of "function":
-      value.function = r.readValue(KdfKind)
+      value = Kdf(function: r.readValue(KdfKind), message: value.message)
       functionSpecified = true
 
     of "params":
@@ -571,6 +675,16 @@ proc readValue*(r: var JsonReader, value: var Kdf)
   if not (functionSpecified and paramsSpecified):
     r.raiseUnexpectedValue(
       "The Kdf value should have sub-fields named 'function' and 'params'")
+
+{.push warning[ProveField]:off.}  # https://github.com/nim-lang/Nim/issues/22060
+proc readValue*(r: var JsonReader[DefaultFlavor], value: var Kdf)
+    {.raises: [SerializationError, IOError].} =
+  readValueImpl(r, value)
+{.pop.}
+
+proc readValue*(r: var JsonReader, value: var (Checksum|Cipher|Kdf)) =
+  static: raiseAssert "Unknown flavor `JsonReader[" & $typeof(r).Flavor &
+    "]` for `readValue` of `" & $typeof(value) & "`"
 
 # HttpHostUri
 proc readValue*(reader: var JsonReader, value: var HttpHostUri) {.
@@ -598,6 +712,9 @@ proc writeValue*(writer: var JsonWriter, value: RemoteKeystore)
   case value.remoteType
   of RemoteSignerType.Web3Signer:
     writer.writeField("type", "web3signer")
+  of RemoteSignerType.VerifyingWeb3Signer:
+    writer.writeField("type", "verifying-web3signer")
+    writer.writeField("proven_block_properties", value.provenBlockProperties)
   if value.description.isSome():
     writer.writeField("description", value.description.get())
   if RemoteKeystoreFlag.IgnoreSSLVerification in value.flags:
@@ -615,11 +732,11 @@ proc readValue*(reader: var JsonReader, value: var RemoteKeystore)
     description: Option[string]
     remote: Option[HttpHostUri]
     remotes: Option[seq[RemoteSignerInfo]]
-    remoteType: Option[string]
+    remoteType: Option[RemoteSignerType]
+    provenBlockProperties: Option[seq[ProvenProperty]]
     ignoreSslVerification: Option[bool]
     pubkey: Option[ValidatorPubKey]
     threshold: Option[uint32]
-    implicitVersion1 = false
 
   # TODO: implementing deserializers for versioned objects
   #       manually is extremely error-prone. This should use
@@ -627,65 +744,119 @@ proc readValue*(reader: var JsonReader, value: var RemoteKeystore)
   for fieldName in readObjectFields(reader):
     case fieldName:
     of "pubkey":
-      if pubkey.isSome():
+      if pubkey.isSome:
         reader.raiseUnexpectedField("Multiple `pubkey` fields found",
                                     "RemoteKeystore")
       pubkey = some(reader.readValue(ValidatorPubKey))
     of "remote":
-      if version.isSome and version.get > 1:
-        reader.raiseUnexpectedField(
-          "The `remote` field is valid only in version 1 of the remote keystore format",
-          "RemoteKeystore")
-
-      if remote.isSome():
+      if remote.isSome:
         reader.raiseUnexpectedField("Multiple `remote` fields found",
+                                    "RemoteKeystore")
+      if remotes.isSome:
+        reader.raiseUnexpectedField("The `remote` field cannot be specified together with `remotes`",
                                     "RemoteKeystore")
       remote = some(reader.readValue(HttpHostUri))
-      implicitVersion1 = true
     of "remotes":
-      if remotes.isSome():
+      if remotes.isSome:
         reader.raiseUnexpectedField("Multiple `remote` fields found",
                                     "RemoteKeystore")
+      if remote.isSome:
+        reader.raiseUnexpectedField("The `remotes` field cannot be specified together with `remote`",
+                                    "RemoteKeystore")
+      if version.isNone:
+        reader.raiseUnexpectedField(
+          "The `remotes` field should be specified after the `version` field of the keystore",
+          "RemoteKeystore")
+      if version.get < 2:
+        reader.raiseUnexpectedField(
+          "The `remotes` field is valid only past version 2 of the remote keystore format",
+          "RemoteKeystore")
       remotes = some(reader.readValue(seq[RemoteSignerInfo]))
     of "version":
-      if version.isSome():
+      if version.isSome:
         reader.raiseUnexpectedField("Multiple `version` fields found",
                                     "RemoteKeystore")
       version = some(reader.readValue(uint64))
-      if implicitVersion1 and version.get > 1'u64:
-        reader.raiseUnexpectedValue(
-          "Remote keystore format doesn't match the specified version number")
-      if version.get > 2'u64:
+      if version.get > 3'u64:
         reader.raiseUnexpectedValue(
           "Remote keystore version " & $version.get &
           " requires a more recent version of Nimbus")
     of "description":
-      let res = reader.readValue(string)
-      if description.isSome():
-        description = some(description.get() & "\n" & res)
-      else:
-        description = some(res)
+      if description.isSome:
+        reader.raiseUnexpectedField("Multiple `description` fields found",
+                                    "RemoteKeystore")
+      description = some(reader.readValue(string))
     of "ignore_ssl_verification":
-      if ignoreSslVerification.isSome():
+      if ignoreSslVerification.isSome:
         reader.raiseUnexpectedField("Multiple conflicting options found",
                                     "RemoteKeystore")
       ignoreSslVerification = some(reader.readValue(bool))
     of "type":
-      if remoteType.isSome():
+      if remoteType.isSome:
         reader.raiseUnexpectedField("Multiple `type` fields found",
                                     "RemoteKeystore")
-      remoteType = some(reader.readValue(string))
+      let remoteTypeValue = case reader.readValue(string).toLowerAscii()
+        of "web3signer":
+          RemoteSignerType.Web3Signer
+        of "verifying-web3signer":
+          RemoteSignerType.VerifyingWeb3Signer
+        else:
+          reader.raiseUnexpectedValue("Unsupported remote signer `type` value")
+      remoteType = some remoteTypeValue
+    of "proven_block_properties":
+      if provenBlockProperties.isSome:
+        reader.raiseUnexpectedField("Multiple `proven_block_properties` fields found",
+                                    "RemoteKeystore")
+      if version.isNone:
+        reader.raiseUnexpectedField(
+          "The `proven_block_properties` field should be specified after the `version` field of the keystore",
+          "RemoteKeystore")
+      if version.get < 3:
+        reader.raiseUnexpectedField(
+          "The `proven_block_properties` field is valid only past version 3 of the remote keystore format",
+          "RemoteKeystore")
+      if remoteType.isNone:
+        reader.raiseUnexpectedField(
+          "The `proven_block_properties` field should be specified after the `type` field of the keystore",
+          "RemoteKeystore")
+      if remoteType.get != RemoteSignerType.VerifyingWeb3Signer:
+        reader.raiseUnexpectedField(
+          "The `proven_block_properties` field can be specified only when the remote signer type is 'verifying-web3signer'",
+          "RemoteKeystore")
+      var provenProperties = reader.readValue(seq[ProvenProperty])
+      for prop in provenProperties.mitems:
+        if prop.path == ".execution_payload.fee_recipient":
+          prop.bellatrixIndex = some GeneralizedIndex(401)
+          prop.capellaIndex = some GeneralizedIndex(401)
+          prop.denebIndex = some GeneralizedIndex(801)
+        elif prop.path == ".graffiti":
+          prop.bellatrixIndex = some GeneralizedIndex(18)
+          prop.capellaIndex = some GeneralizedIndex(18)
+          prop.denebIndex = some GeneralizedIndex(18)
+        else:
+          reader.raiseUnexpectedValue("Keystores with proven properties different than " &
+                                      "`.execution_payload.fee_recipient` and `.graffiti` " &
+                                      "require a more recent version of Nimbus")
+      provenBlockProperties = some provenProperties
     of "threshold":
-      if threshold.isSome():
+      if threshold.isSome:
         reader.raiseUnexpectedField("Multiple `threshold` fields found",
                                     "RemoteKeystore")
+      if version.isNone:
+        reader.raiseUnexpectedField(
+          "The `threshold` field should be specified after the `version` field of the keystore",
+          "RemoteKeystore")
+      if version.get < 2:
+        reader.raiseUnexpectedField(
+          "The `threshold` field is valid only past version 2 of the remote keystore format",
+          "RemoteKeystore")
       threshold = some(reader.readValue(uint32))
     else:
       # Ignore unknown field names.
       discard
 
   if version.isNone():
-    reader.raiseUnexpectedValue("Field `version` is missing")
+    reader.raiseUnexpectedValue("The required field `version` is missing")
   if remotes.isNone():
     if remote.isSome and pubkey.isSome:
       remotes = some @[RemoteSignerInfo(
@@ -694,20 +865,27 @@ proc readValue*(reader: var JsonReader, value: var RemoteKeystore)
         url: remote.get
       )]
     else:
-      reader.raiseUnexpectedValue("Field `remotes` is missing")
+      reader.raiseUnexpectedValue("The required field `remotes` is missing")
+
+  if threshold.isNone:
+    if remotes.get.len > 1:
+      reader.raiseUnexpectedValue("The `threshold` field must be specified when using distributed keystores")
+  else:
+    if threshold.get.uint64 > remotes.get.lenu64:
+      reader.raiseUnexpectedValue("The specified `threshold` must be lower than the number of remote signers")
+
   if pubkey.isNone():
     reader.raiseUnexpectedValue("Field `pubkey` is missing")
 
-  let keystoreType =
-    if remoteType.isSome():
-      let res = remoteType.get()
-      case res.toLowerAscii()
-      of "web3signer":
-        RemoteSignerType.Web3Signer
-      else:
-        reader.raiseUnexpectedValue("Unsupported remote signer `type` value")
-    else:
-      RemoteSignerType.Web3Signer
+  if version.get >= 3:
+    if remoteType.isNone:
+      reader.raiseUnexpectedValue("The required field `type` is missing")
+    case remoteType.get
+    of RemoteSignerType.Web3Signer:
+      discard
+    of RemoteSignerType.VerifyingWeb3Signer:
+      if provenBlockProperties.isNone:
+        reader.raiseUnexpectedValue("The required field `proven_block_properties` is missing")
 
   let keystoreFlags =
     block:
@@ -716,14 +894,24 @@ proc readValue*(reader: var JsonReader, value: var RemoteKeystore)
         res.incl(RemoteKeystoreFlag.IgnoreSSLVerification)
       res
 
-  value = RemoteKeystore(
-    version: 2'u64,
-    pubkey: pubkey.get,
-    description: description,
-    remoteType: keystoreType,
-    remotes: remotes.get,
-    threshold: threshold.get(1),
-  )
+  value = case remoteType.get(RemoteSignerType.Web3Signer)
+    of RemoteSignerType.Web3Signer:
+      RemoteKeystore(
+        version: 2'u64,
+        pubkey: pubkey.get,
+        description: description,
+        remoteType: RemoteSignerType.Web3Signer,
+        remotes: remotes.get,
+        threshold: threshold.get(1))
+    of RemoteSignerType.VerifyingWeb3Signer:
+      RemoteKeystore(
+        version: 2'u64,
+        pubkey: pubkey.get,
+        description: description,
+        remoteType: RemoteSignerType.VerifyingWeb3Signer,
+        provenBlockProperties: provenBlockProperties.get,
+        remotes: remotes.get,
+        threshold: threshold.get(1))
 
 template writeValue*(w: var JsonWriter,
                      value: Pbkdf2Salt|SimpleHexEncodedTypes|Aes128CtrIv) =
@@ -763,16 +951,24 @@ proc decryptCryptoField*(crypto: Crypto, decKey: openArray[byte],
     return DecryptionStatus.InvalidKeystore
   if len(decKey) < keyLen:
     return DecryptionStatus.InvalidKeystore
-  let derivedChecksum = shaChecksum(decKey.toOpenArray(16, 31),
-                                    crypto.cipher.message.bytes)
-  if derivedChecksum != crypto.checksum.message:
+  let valid =
+    case crypto.checksum.function
+    of sha256Checksum:
+      template params: auto {.used.} = crypto.checksum.params
+      template message: auto = crypto.checksum.message
+      message == shaChecksum(decKey.toOpenArray(16, 31),
+                             crypto.cipher.message.bytes)
+  if not valid:
     return DecryptionStatus.InvalidPassword
 
-  var aesCipher: CTR[aes128]
-  outSecret.setLen(crypto.cipher.message.bytes.len)
-  aesCipher.init(decKey.toOpenArray(0, 15), crypto.cipher.params.iv.bytes)
-  aesCipher.decrypt(crypto.cipher.message.bytes, outSecret)
-  aesCipher.clear()
+  case crypto.cipher.function
+  of aes128CtrCipher:
+    template params: auto = crypto.cipher.params
+    var aesCipher: CTR[aes128]
+    outSecret.setLen(crypto.cipher.message.bytes.len)
+    aesCipher.init(decKey.toOpenArray(0, 15), params.iv.bytes)
+    aesCipher.decrypt(crypto.cipher.message.bytes, outSecret)
+    aesCipher.clear()
   DecryptionStatus.Success
 
 proc getDecryptionKey*(crypto: Crypto, password: KeystorePass,
@@ -851,6 +1047,7 @@ proc getSaltKey(keystore: Keystore, password: KeystorePass): KdfSaltKey =
 proc `==`*(a, b: KdfSaltKey): bool {.borrow.}
 proc hash*(salt: KdfSaltKey): Hash {.borrow.}
 
+{.push warning[ProveField]:off.}
 func `==`*(a, b: Kdf): bool =
   # We do not care about `message` field.
   if a.function != b.function:
@@ -869,6 +1066,7 @@ func `==`*(a, b: Kdf): bool =
     (aparams.p == bparams.p) and (aparams.r == bparams.r) and
     (len(seq[byte](aparams.salt)) > 0) and
     (seq[byte](aparams.salt) == seq[byte](bparams.salt))
+{.pop.}
 
 func `==`*(a, b: Cipher): bool =
   # We do not care about `params` and `message` fields.
@@ -1175,13 +1373,13 @@ proc createWallet*(kdfKind: KdfKind,
     crypto: crypto,
     nextAccount: nextAccount.get(0))
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/validator.md#bls_withdrawal_prefix
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/validator.md#bls_withdrawal_prefix
 func makeWithdrawalCredentials*(k: ValidatorPubKey): Eth2Digest =
   var bytes = eth2digest(k.toRaw())
   bytes.data[0] = BLS_WITHDRAWAL_PREFIX.uint8
   bytes
 
-# https://github.com/ethereum/consensus-specs/blob/v0.12.2/specs/phase0/deposit-contract.md#withdrawal-credentials
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/deposit-contract.md#withdrawal-credentials
 proc makeWithdrawalCredentials*(k: CookedPubKey): Eth2Digest =
   makeWithdrawalCredentials(k.toPubKey())
 

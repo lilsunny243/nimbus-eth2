@@ -56,6 +56,14 @@ proc getStateValidators*(state_id: StateIdent,
      meth: MethodGet.}
   ## https://ethereum.github.io/beacon-APIs/#/Beacon/getStateValidators
 
+proc getStateValidatorsPlain*(
+       state_id: StateIdent,
+       id: seq[ValidatorIdent]
+     ): RestPlainResponse {.
+     rest, endpoint: "/eth/v1/beacon/states/{state_id}/validators",
+     meth: MethodGet.}
+  ## https://ethereum.github.io/beacon-APIs/#/Beacon/getStateValidators
+
 proc getStateValidator*(state_id: StateIdent,
                         validator_id: ValidatorIdent
                        ): RestResponse[GetStateValidatorResponse] {.
@@ -78,6 +86,12 @@ proc getStateValidatorBalances*(state_id: StateIdent
      meth: MethodGet.}
   ## https://ethereum.github.io/beacon-APIs/#/Beacon/getStateValidators
 
+proc getStateRandao*(state_id: StateIdent
+             ): RestResponse[GetStateRandaoResponse] {.
+     rest, endpoint: "/eth/v1/beacon/states/{state_id}/randao",
+     meth: MethodGet.}
+  ## https://ethereum.github.io/beacon-APIs/#/Beacon/getStateRandao
+
 proc getEpochCommittees*(state_id: StateIdent, epoch: Option[Epoch],
                         ): RestResponse[GetEpochCommitteesResponse] {.
      rest, endpoint: "/eth/v1/beacon/states/{state_id}/committees",
@@ -96,10 +110,42 @@ proc getBlockHeaders*(slot: Option[Slot], parent_root: Option[Eth2Digest]
      meth: MethodGet.}
   ## https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeaders
 
-proc getBlockHeader*(block_id: BlockIdent): RestResponse[GetBlockHeaderResponse] {.
+# proc getBlockHeader*(block_id: BlockIdent): RestResponse[GetBlockHeaderResponse] {.
+#      rest, endpoint: "/eth/v1/beacon/headers/{block_id}",
+#      meth: MethodGet.}
+#   ## https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeader
+
+proc getBlockHeaderPlain*(block_id: BlockIdent): RestPlainResponse {.
      rest, endpoint: "/eth/v1/beacon/headers/{block_id}",
      meth: MethodGet.}
   ## https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeader
+
+proc getBlockHeader*(
+       client: RestClientRef,
+       block_id: BlockIdent
+     ): Future[Opt[GetBlockHeaderResponse]] {.async.} =
+  ## https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeader
+  let resp = await client.getBlockHeaderPlain(block_id)
+  return
+    case resp.status
+    of 200:
+      let response = decodeBytes(GetBlockHeaderResponse, resp.data,
+                                 resp.contentType).valueOr:
+        raise newException(RestError, $error)
+      Opt.some(response)
+    of 404:
+      Opt.none(GetBlockHeaderResponse)
+    of 400, 500:
+      let error = decodeBytes(RestErrorMessage, resp.data,
+                              resp.contentType).valueOr:
+        let msg = "Incorrect response error format (" & $resp.status &
+                  ") [" & $error & "]"
+        raise (ref RestResponseError)(msg: msg, status: resp.status)
+      let msg = "Error response (" & $resp.status & ") [" & error.message & "]"
+      raise (ref RestResponseError)(
+        msg: msg, status: error.code, message: error.message)
+    else:
+      raiseRestResponseError(resp)
 
 proc publishBlock*(body: phase0.SignedBeaconBlock): RestPlainResponse {.
      rest, endpoint: "/eth/v1/beacon/blocks",
@@ -144,6 +190,12 @@ proc publishBlindedBlock*(body: altair.SignedBeaconBlock): RestPlainResponse {.
   ## https://ethereum.github.io/beacon-APIs/#/Beacon/publishBlindedBlock
 
 proc publishBlindedBlock*(body: bellatrix_mev.SignedBlindedBeaconBlock):
+       RestPlainResponse {.
+     rest, endpoint: "/eth/v1/beacon/blinded_blocks",
+     meth: MethodPost.}
+  ## https://ethereum.github.io/beacon-APIs/#/Beacon/publishBlindedBlock
+
+proc publishBlindedBlock*(body: capella_mev.SignedBlindedBeaconBlock):
        RestPlainResponse {.
      rest, endpoint: "/eth/v1/beacon/blinded_blocks",
      meth: MethodPost.}
@@ -214,6 +266,11 @@ proc getBlockV2*(client: RestClientRef, block_id: BlockIdent,
       raiseRestResponseError(resp)
 
 proc getBlockRoot*(block_id: BlockIdent): RestResponse[GetBlockRootResponse] {.
+     rest, endpoint: "/eth/v1/beacon/blocks/{block_id}/root",
+     meth: MethodGet.}
+  ## https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockRoot
+
+proc getBlockRootPlain*(block_id: BlockIdent): RestPlainResponse {.
      rest, endpoint: "/eth/v1/beacon/blocks/{block_id}/root",
      meth: MethodGet.}
   ## https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockRoot

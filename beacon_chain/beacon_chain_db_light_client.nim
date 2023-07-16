@@ -27,14 +27,14 @@ logScope: topics = "lcdata"
 # Mainnet data size (all columns):
 # - Altair: ~38 KB per `SyncCommitteePeriod` (~1.0 MB per month)
 # - Capella: ~222 KB per `SyncCommitteePeriod` (~6.1 MB per month)
-# - EIP4844: ~230 KB per `SyncCommitteePeriod` (~6.3 MB per month)
+# - Deneb: ~230 KB per `SyncCommitteePeriod` (~6.3 MB per month)
 #
 # `lc_altair_current_branches` holds merkle proofs needed to
 # construct `LightClientBootstrap` objects.
 # SSZ because this data does not compress well, and because this data
 # needs to be bundled together with other data to fulfill requests.
 # Mainnet data size (all columns):
-# - Altair ... EIP4844: ~42 KB per `SyncCommitteePeriod` (~1.1 MB per month)
+# - Altair ... Deneb: ~42 KB per `SyncCommitteePeriod` (~1.1 MB per month)
 #
 # `lc_altair_sync_committees` contains a copy of finalized sync committees.
 # They are initially populated from the main DAG (usually a fast state access).
@@ -42,7 +42,7 @@ logScope: topics = "lcdata"
 # SSZ because this data does not compress well, and because this data
 # needs to be bundled together with other data to fulfill requests.
 # Mainnet data size (all columns):
-# - Altair ... EIP4844: ~32 KB per `SyncCommitteePeriod` (~0.9 MB per month)
+# - Altair ... Deneb: ~32 KB per `SyncCommitteePeriod` (~0.9 MB per month)
 #
 # `lc_best_updates` holds full `LightClientUpdate` objects in SSZ form.
 # These objects are frequently queried in bulk, but there is only one per
@@ -58,7 +58,7 @@ logScope: topics = "lcdata"
 # Mainnet data size (all columns):
 # - Altair: ~33 KB per `SyncCommitteePeriod` (~0.9 MB per month)
 # - Capella: ~34 KB per `SyncCommitteePeriod` (~0.9 MB per month)
-# - EIP4844: ~34 KB per `SyncCommitteePeriod` (~0.9 MB per month)
+# - Deneb: ~34 KB per `SyncCommitteePeriod` (~0.9 MB per month)
 #
 # `lc_sealed_periods` contains the sync committee periods for which
 # full light client data was imported. Data for these periods may no longer
@@ -194,7 +194,7 @@ proc getHeader*[T: ForkyLightClientHeader](
     res.expect("SQL query OK")
     try:
       return ok SSZ.decode(header, T)
-    except SszError as exc:
+    except SerializationError as exc:
       error "LC data store corrupted", store = "headers", kind = T.kind,
         blockRoot, exc = exc.msg
       return Opt.none(T)
@@ -278,7 +278,7 @@ proc getCurrentSyncCommitteeBranch*(
     res.expect("SQL query OK")
     try:
       return ok SSZ.decode(branch, altair.CurrentSyncCommitteeBranch)
-    except SszError as exc:
+    except SerializationError as exc:
       error "LC data store corrupted", store = "currentBranches",
         slot, exc = exc.msg
       return Opt.none(altair.CurrentSyncCommitteeBranch)
@@ -361,7 +361,7 @@ proc getSyncCommittee*(
     res.expect("SQL query OK")
     try:
       return ok SSZ.decode(branch, altair.SyncCommittee)
-    except SszError as exc:
+    except SerializationError as exc:
       error "LC data store corrupted", store = "syncCommittees",
         period, exc = exc.msg
       return Opt.none(altair.SyncCommittee)
@@ -499,8 +499,7 @@ proc getBestUpdate*(
   doAssert period.isSupportedBySQLite
 
   var update: (int64, seq[byte])
-  template body: untyped =
-    res.expect("SQL query OK")
+  proc processUpdate(): ForkedLightClientUpdate =
     try:
       withAll(LightClientDataFork):
         when lcDataFork > LightClientDataFork.None:
@@ -512,19 +511,20 @@ proc getBestUpdate*(
       warn "Unsupported LC data store kind", store = "bestUpdates",
         period, kind = update[0]
       return default(ForkedLightClientUpdate)
-    except SszError as exc:
+    except SerializationError as exc:
       error "LC data store corrupted", store = "bestUpdates",
         period, kind = update[0], exc = exc.msg
       return default(ForkedLightClientUpdate)
 
   if distinctBase(db.bestUpdates.getStmt) != nil:
     for res in db.bestUpdates.getStmt.exec(period.int64, update):
-      body
-  elif distinctBase(db.legacyBestUpdates.getStmt) != nil:
+      res.expect("SQL query OK")
+      return processUpdate()
+  if distinctBase(db.legacyBestUpdates.getStmt) != nil:
     for res in db.legacyBestUpdates.getStmt.exec(period.int64, update):
-      body
-  else:
-    return default(ForkedLightClientUpdate)
+      res.expect("SQL query OK")
+      return processUpdate()
+  default(ForkedLightClientUpdate)
 
 func putBestUpdate*(
     db: LightClientDataDB, period: SyncCommitteePeriod,
@@ -675,7 +675,7 @@ func keepPeriodsFrom*(
 type LightClientDataDBNames* = object
   altairHeaders*: string
   capellaHeaders*: string
-  eip4844Headers*: string
+  denebHeaders*: string
   altairCurrentBranches*: string
   altairSyncCommittees*: string
   legacyAltairBestUpdates*: string
@@ -685,7 +685,7 @@ type LightClientDataDBNames* = object
 proc initLightClientDataDB*(
     backend: SqStoreRef,
     names: LightClientDataDBNames): KvResult[LightClientDataDB] =
-  static: doAssert LightClientDataFork.high == LightClientDataFork.EIP4844
+  static: doAssert LightClientDataFork.high == LightClientDataFork.Deneb
   let
     headers = [
       # LightClientDataFork.None
@@ -696,9 +696,9 @@ proc initLightClientDataDB*(
       # LightClientDataFork.Capella
       ? backend.initHeadersStore(
         names.capellaHeaders, "capella.LightClientHeader"),
-      # LightClientDataFork.EIP4844
+      # LightClientDataFork.Deneb
       ? backend.initHeadersStore(
-        names.eip4844Headers, "eip4844.LightClientHeader")
+        names.denebHeaders, "deneb.LightClientHeader")
     ]
     currentBranches =
       ? backend.initCurrentBranchesStore(names.altairCurrentBranches)

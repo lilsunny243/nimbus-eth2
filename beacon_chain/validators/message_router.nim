@@ -17,7 +17,7 @@ import
   ../gossip_processing/eth2_processor,
   ../networking/eth2_network,
   ./activity_metrics,
-  ../spec/datatypes/eip4844
+  ../spec/datatypes/deneb
 
 export eth2_processor, eth2_network
 
@@ -78,22 +78,23 @@ template blockProcessor(router: MessageRouter): ref BlockProcessor =
 template getCurrentBeaconTime(router: MessageRouter): BeaconTime =
   router.processor[].getCurrentBeaconTime()
 
-type RouteBlockResult* = Result[Opt[BlockRef], cstring]
+type RouteBlockResult = Result[Opt[BlockRef], cstring]
 proc routeSignedBeaconBlock*(
-    router: ref MessageRouter, blckAndBlobs: ForkySignedBeaconBlockMaybeBlobs):
+    router: ref MessageRouter, blck: ForkySignedBeaconBlock):
     Future[RouteBlockResult] {.async.} =
   ## Validate and broadcast beacon block, then add it to the block database
   ## Returns the new Head when block is added successfully to dag, none when
   ## block passes validation but is not added, and error otherwise
-  let
-    wallTime = router[].getCurrentBeaconTime()
-    blck = toSignedBeaconBlock(blckAndBlobs)
+  let wallTime = router[].getCurrentBeaconTime()
 
   # Start with a quick gossip validation check such that broadcasting the
   # block doesn't get the node into trouble
   block:
     let res = validateBeaconBlock(
-      router[].dag, router[].quarantine, blckAndBlobs, wallTime, {})
+      router[].dag, router[].quarantine, blck, wallTime, {})
+
+    # TODO blob gossip validation
+    debugRaiseAssert $denebImplementationMissing
 
     if not res.isGoodForSending():
       warn "Block failed validation",
@@ -108,11 +109,7 @@ proc routeSignedBeaconBlock*(
     # now. In fact, per the spec, we should broadcast it even if it later fails
     # to apply to our state.
 
-  let res =
-    when blckAndBlobs is eip4844.SignedBeaconBlockAndBlobsSidecar:
-      await router[].network.broadcastBeaconBlockAndBlobsSidecar(blckAndBlobs)
-    else:
-      await router[].network.broadcastBeaconBlock(blck)
+  let res = await router[].network.broadcastBeaconBlock(blck)
 
   if res.isOk():
     beacon_blocks_sent.inc()
@@ -127,15 +124,26 @@ proc routeSignedBeaconBlock*(
       signature = shortLog(blck.signature), error = res.error()
 
   let newBlockRef = await router[].blockProcessor.storeBlock(
-    MsgSource.api, sendTime, blck, optBlobs(blckAndBlobs))
+    MsgSource.api, sendTime, blck, Opt.none(BlobSidecars))
 
   # The boolean we return tells the caller whether the block was integrated
   # into the chain
   if newBlockRef.isErr():
-    warn "Unable to add routed block to block pool",
-      blockRoot = shortLog(blck.root), blck = shortLog(blck.message),
-      signature = shortLog(blck.signature), err = newBlockRef.error()
-    return ok(Opt.none(BlockRef))
+    return if newBlockRef.error()[0] != VerifierError.Duplicate:
+      warn "Unable to add routed block to block pool",
+        blockRoot = shortLog(blck.root), blck = shortLog(blck.message),
+        signature = shortLog(blck.signature), err = newBlockRef.error()
+      ok(Opt.none(BlockRef))
+    else:
+      # If it's duplicate, there's an existing BlockRef to return. The block
+      # shouldn't be finalized already because that requires a couple epochs
+      # before occurring, so only check non-finalized resolved blockrefs.
+      let blockRef = router[].dag.getBlockRef(blck.root)
+      if blockRef.isErr:
+        warn "Unable to add routed duplicate block to block pool",
+          blockRoot = shortLog(blck.root), blck = shortLog(blck.message),
+          signature = shortLog(blck.signature), err = newBlockRef.error()
+      ok(blockRef)
 
   return ok(Opt.some(newBlockRef.get()))
 
@@ -277,8 +285,8 @@ proc routeSyncCommitteeMessages*(
     router: ref MessageRouter, msgs: seq[SyncCommitteeMessage]):
     Future[seq[SendResult]] {.async.} =
   return withState(router[].dag.headState):
-    when stateFork >= ConsensusFork.Altair:
-      var statuses = newSeq[Option[SendResult]](len(msgs))
+    when consensusFork >= ConsensusFork.Altair:
+      var statuses = newSeq[Opt[SendResult]](len(msgs))
 
       let
         curPeriod = sync_committee_period(forkyState.data.slot)
@@ -297,10 +305,11 @@ proc routeSyncCommitteeMessages*(
               elif msgPeriod == nextPeriod:
                 resNxt[msg.validator_index] = index
               else:
-                statuses[index] =
-                  some(SendResult.err("Message's slot out of state's head range"))
+                statuses[index] = Opt.some(
+                  SendResult.err("Message's slot out of state's head range"))
             else:
-              statuses[index] = some(SendResult.err("Incorrect validator's index"))
+              statuses[index] = Opt.some(
+                SendResult.err("Incorrect validator's index"))
           if (len(resCur) == 0) and (len(resNxt) == 0):
             return statuses.mapIt(it.get())
           (resCur, resNxt)
@@ -330,17 +339,17 @@ proc routeSyncCommitteeMessages*(
       await allFutures(pending)
 
       for index, future in pending:
-        if future.done():
+        if future.completed():
           let fres = future.read()
           if fres.isErr():
-            statuses[indices[index]] = some(SendResult.err(fres.error()))
+            statuses[indices[index]] = Opt.some(SendResult.err(fres.error()))
           else:
-            statuses[indices[index]] = some(SendResult.ok())
+            statuses[indices[index]] = Opt.some(SendResult.ok())
         elif future.failed() or future.cancelled():
           let exc = future.readError()
           debug "Unexpected failure while sending committee message",
             message = msgs[indices[index]], error = $exc.msg
-          statuses[indices[index]] = some(SendResult.err(
+          statuses[indices[index]] = Opt.some(SendResult.err(
             "Unexpected failure while sending committee message"))
 
       var res: seq[SendResult]

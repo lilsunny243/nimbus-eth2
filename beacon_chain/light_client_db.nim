@@ -147,8 +147,7 @@ proc getLatestFinalizedHeader*(
   const key = LightClientHeaderKey.Finalized
 
   var header: (int64, seq[byte])
-  template body: untyped =
-    res.expect("SQL query OK")
+  proc processHeader(): ForkedLightClientHeader =
     try:
       withAll(LightClientDataFork):
         when lcDataFork > LightClientDataFork.None:
@@ -160,19 +159,20 @@ proc getLatestFinalizedHeader*(
       warn "Unsupported LC store kind", store = "headers",
         key, kind = header[0]
       return default(ForkedLightClientHeader)
-    except SszError as exc:
+    except SerializationError as exc:
       error "LC store corrupted", store = "headers",
         key, kind = header[0], exc = exc.msg
       return default(ForkedLightClientHeader)
 
   if distinctBase(db.headers.getStmt) != nil:
     for res in db.headers.getStmt.exec(key.int64, header):
-      body
-  elif distinctBase(db.legacyHeaders.getStmt) != nil:
+      res.expect("SQL query OK")
+      return processHeader()
+  if distinctBase(db.legacyHeaders.getStmt) != nil:
     for res in db.legacyHeaders.getStmt.exec(key.int64, header):
-      body
-  else:
-    return default(ForkedLightClientHeader)
+      res.expect("SQL query OK")
+      return processHeader()
+  default(ForkedLightClientHeader)
 
 func putLatestFinalizedHeader*(
     db: LightClientDB, header: ForkedLightClientHeader) =
@@ -248,7 +248,7 @@ proc getSyncCommittee*(
     res.expect("SQL query OK")
     try:
       return ok SSZ.decode(syncCommittee, altair.SyncCommittee)
-    except SszError as exc:
+    except SerializationError as exc:
       error "LC store corrupted", store = "syncCommittees",
         period, exc = exc.msg
       return Opt.none(altair.SyncCommittee)

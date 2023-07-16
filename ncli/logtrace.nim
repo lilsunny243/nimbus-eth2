@@ -1,12 +1,14 @@
 # beacon_chain
-# Copyright (c) 2018-2021 Status Research & Development GmbH
+# Copyright (c) 2018-2023 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
-import confutils, json, times, streams, os, strutils, options, chronicles,
-       tables, sequtils
-import json_serialization
+import
+  std/[tables, sequtils, json, times, streams, os, strutils, options, typetraits],
+  confutils, chronicles, json_serialization
+
+from stew/io2 import IoErrorCode
 
 const
   LogTraceName = "Beacon-Chain LogTrace Tool"
@@ -15,62 +17,62 @@ const
   LogTracePatch: int = 4
   LogTraceVersion = $LogTraceMajor & "." & $LogTraceMinor & "." &
                       $LogTracePatch
-  LogTraceCopyright = "Copyright(C) 2021" &
+  LogTraceCopyright = "Copyright(C) 2021-2023" &
                        " Status Research & Development GmbH"
   LogTraceHeader = LogTraceName & ", Version " & LogTraceVersion &
                     " [" & hostOS & ": " & hostCPU & "]\r\n" &
                     LogTraceCopyright & "\r\n"
 
 type
-  StartUpCommand {.pure.} = enum
+  StartUpCommand* {.pure.} = enum
     pubsub, asl, asr, aggasr, scmsr, csr, lat, traceAll, localSimChecks
 
-  LogTraceConf = object
-    logFiles {.
+  LogTraceConf* = object
+    logFiles* {.
       desc: "Specifies one or more log files",
       abbr: "f",
       name: "log-file" .}: seq[string]
 
-    simDir {.
+    simDir* {.
       desc: "Specifies path to eth2_network_simulation directory",
       defaultValue: "",
       name: "sim-dir" .}: string
 
-    netDir {.
+    netDir* {.
       desc: "Specifies path to network build directory",
       defaultValue: "",
       name: "net-dir" .}: string
 
-    logDir {.
+    logDir* {.
       desc: "Specifies path with bunch of logs",
       defaultValue: "",
       name: "log-dir" .}: string
 
-    ignoreSerializationErrors {.
+    ignoreSerializationErrors* {.
       desc: "Ignore serialization errors while parsing log files",
       defaultValue: true,
       name: "ignore-errors" .}: bool
 
-    dumpSerializationErrors {.
+    dumpSerializationErrors* {.
       desc: "Dump full serialization errors while parsing log files",
       defaultValue: false ,
       name: "dump-errors" .}: bool
 
-    nodes {.
+    nodes* {.
       desc: "Specifies node names which logs will be used",
       name: "nodes" .}: seq[string]
 
-    allowedLag {.
+    allowedLag* {.
       desc: "Allowed latency lag multiplier",
       defaultValue: 2.0,
       name: "lag" .}: float
 
-    constPreset {.
+    constPreset* {.
       desc: "The const preset being used"
       defaultValue: "mainnet"
       name: "const-preset" .}: string
 
-    case cmd {.command.}: StartUpCommand
+    case cmd* {.command.}: StartUpCommand
     of pubsub:
       discard
     of asl:
@@ -193,7 +195,9 @@ type
           "voluntary_exits_len": 0,
           "sync_committee_participants": 32,
           "block_number": 0,
-          "fee_recipient": ""
+          "fee_recipient": "",
+          "bls_to_execution_changes_len": 0,
+          "blob_kzg_commitments_len": 0
         },
         "signature": "b544f144",
         "delay": "32ms3us"
@@ -316,12 +320,23 @@ template warning(issuesGroup: IssuesGroup, msg: string) =
 proc new(T: type IssuesGroup, name: string): T =
   T(name: name)
 
-proc readValue(reader: var JsonReader, value: var DateTime) =
+# TODO These definition can be moved to a more widely accessible module.
+# It's needed when we compile logtrace itself with JSON logging.
+proc writeValue*(writer: var JsonWriter, value: DateTime) =
+  writer.writeValue($value)
+
+proc readValue*(reader: var JsonReader, value: var DateTime) =
   let s = reader.readValue(string)
   try:
     value = parse(s, "YYYY-MM-dd HH:mm:ss'.'fffzzz", utc())
   except CatchableError:
     raiseUnexpectedValue(reader, "Invalid date time")
+
+proc writeValue*(writer: var JsonWriter, value: IoErrorCode) =
+  writer.writeValue(distinctBase value)
+
+proc readValue*(reader: var JsonReader, value: var IoErrorCode) =
+  IoErrorCode reader.readValue(distinctBase IoErrorCode)
 
 proc init(t: typedesc[GossipMessage], kind: GossipDirection, id,
           datestr: string): GossipMessage =
@@ -1099,7 +1114,7 @@ proc runLatencyCheck(logConf: LogTraceConf, logFiles: seq[string],
     info "Latency statistics", min_time = minTime, max_time = maxTime,
                                avg_time = avgTime, seconds_count = len(msgs)
 
-proc run(conf: LogTraceConf) =
+proc run*(conf: LogTraceConf) =
   var logFiles: seq[string]
   var logNodes: seq[NodeDirectory]
 

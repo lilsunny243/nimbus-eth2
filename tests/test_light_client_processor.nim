@@ -9,7 +9,7 @@
 
 import
   # Status libraries
-  chronos, eth/keys,
+  chronos,
   # Beacon chain internals
   ../beacon_chain/consensus_object_pools/
     [block_clearance, block_quarantine, blockchain_dag],
@@ -25,30 +25,32 @@ suite "Light client processor" & preset():
     highPeriod = 5.SyncCommitteePeriod
   let
     cfg = block:  # Fork schedule so that each `LightClientDataFork` is covered
-      static: doAssert ConsensusFork.high == ConsensusFork.EIP4844
+      static: doAssert ConsensusFork.high == ConsensusFork.Deneb
       var res = defaultRuntimeConfig
       res.ALTAIR_FORK_EPOCH = 1.Epoch
       res.BELLATRIX_FORK_EPOCH = 2.Epoch
-      # $capellaImplementationMissing res.CAPELLA_FORK_EPOCH = (EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 1).Epoch
-      # $eip4844ImplementationMissing res.DENEB_FORK_EPOCH = (EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 2).Epoch
+      res.CAPELLA_FORK_EPOCH = (EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 1).Epoch
+      res.DENEB_FORK_EPOCH = (EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 2).Epoch
       res
 
   const numValidators = SLOTS_PER_EPOCH
   let
     validatorMonitor = newClone(ValidatorMonitor.init())
     dag = ChainDAGRef.init(
-      cfg, makeTestDB(numValidators), validatorMonitor, {},
+      cfg, makeTestDB(numValidators, cfg = cfg), validatorMonitor, {},
       lcDataConfig = LightClientDataConfig(
         serve: true,
         importMode: LightClientDataImportMode.OnlyNew))
     quarantine = newClone(Quarantine.init())
+    rng = HmacDrbgContext.new()
     taskpool = Taskpool.new()
-  var verifier = BatchVerifier(rng: keys.newRng(), taskpool: taskpool)
+  var verifier = BatchVerifier(rng: rng, taskpool: taskpool)
 
   var cache: StateCache
   proc addBlocks(blocks: uint64, syncCommitteeRatio: float) =
-    for blck in makeTestBlocks(dag.headState, cache, blocks.int,
-                               attested = true, syncCommitteeRatio, cfg):
+    for blck in makeTestBlocks(
+        dag.headState, cache, blocks.int, attested = true,
+        syncCommitteeRatio = syncCommitteeRatio, cfg = cfg):
       let added =
         case blck.kind
         of ConsensusFork.Phase0:
@@ -63,11 +65,11 @@ suite "Light client processor" & preset():
         of ConsensusFork.Capella:
           const nilCallback = OnCapellaBlockAdded(nil)
           dag.addHeadBlock(verifier, blck.capellaData, nilCallback)
-        of ConsensusFork.EIP4844:
-          const nilCallback = OnEIP4844BlockAdded(nil)
-          dag.addHeadBlock(verifier, blck.eip4844Data, nilCallback)
+        of ConsensusFork.Deneb:
+          const nilCallback = OnDenebBlockAdded(nil)
+          dag.addHeadBlock(verifier, blck.denebData, nilCallback)
       doAssert added.isOk()
-      dag.updateHead(added[], quarantine[])
+      dag.updateHead(added[], quarantine[], [])
 
   addBlocks(SLOTS_PER_EPOCH, 0.82)
   let
